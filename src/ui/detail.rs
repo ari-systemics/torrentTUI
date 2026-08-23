@@ -11,16 +11,16 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Tabs},
+    widgets::{Block, BorderType, Borders, Paragraph, Tabs},
     Frame,
 };
 
 use crate::app::App;
 use crate::types::{DetailTab, PeerInfo};
 use crate::ui::layout::{format_eta, format_size, format_speed};
-use crate::ui::progress::render_progress_bar;
+use crate::ui::progress::render_progress_bar_styled;
 use crate::ui::util::{is_streamable_media, truncate};
 
 pub fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
@@ -42,14 +42,15 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let header = Paragraph::new(Line::from(vec![Span::styled(
         torrent_name,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(app.theme.accent)
             .add_modifier(Modifier::BOLD),
     )]))
     .block(
         Block::default()
             .title(" Torrent Detail ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(app.theme.accent)),
     );
     f.render_widget(header, chunks[0]);
 
@@ -57,16 +58,17 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let tab_titles = vec!["Stats", "Info", "Files", "Peers"];
     let tabs = Tabs::new(tab_titles)
         .select(tab_index)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(app.theme.text_dim))
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(app.theme.accent)),
         );
     f.render_widget(tabs, chunks[1]);
 
@@ -80,37 +82,42 @@ pub fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_stats_tab(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let torrent = match app.selected_torrent() {
         Some(t) => t,
         None => return,
     };
 
     let percent = torrent.progress_percent();
-    let progress = render_progress_bar(percent, 30);
+    let progress = render_progress_bar_styled(percent, 30, theme);
 
     let stats_text = vec![
         Line::from(vec![
-            Span::styled("  Status:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Status:    ", Style::default().fg(theme.text_dim)),
             Span::raw(torrent.status.to_string()),
         ]),
         Line::from(vec![
-            Span::styled("  Size:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Size:      ", Style::default().fg(theme.text_dim)),
             Span::raw(format!(
                 "{} / {}",
                 format_size(torrent.downloaded_bytes),
                 format_size(torrent.size_bytes)
             )),
         ]),
+        Line::from(
+            std::iter::once(Span::styled(
+                "  Progress:  ",
+                Style::default().fg(theme.text_dim),
+            ))
+            .chain(progress.spans)
+            .collect::<Vec<_>>(),
+        ),
         Line::from(vec![
-            Span::styled("  Progress:  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(progress),
-        ]),
-        Line::from(vec![
-            Span::styled("  Uploaded:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Uploaded:  ", Style::default().fg(theme.text_dim)),
             Span::raw(format_size(torrent.uploaded_bytes)),
         ]),
         Line::from(vec![
-            Span::styled("  Ratio:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Ratio:     ", Style::default().fg(theme.text_dim)),
             Span::raw(if torrent.downloaded_bytes > 0 {
                 format!(
                     "{:.2}",
@@ -121,28 +128,28 @@ fn render_stats_tab(f: &mut Frame, area: Rect, app: &App) {
             }),
         ]),
         Line::from(vec![
-            Span::styled("  Down:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Down:      ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 format_speed(torrent.download_speed),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.download),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Up:        ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Up:        ", Style::default().fg(theme.text_dim)),
             Span::styled(
                 format_speed(torrent.upload_speed),
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(theme.upload),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Peers:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Peers:     ", Style::default().fg(theme.text_dim)),
             Span::raw(format!(
                 "{} connected / {} total",
                 torrent.peers_connected, torrent.peers_total
             )),
         ]),
         Line::from(vec![
-            Span::styled("  ETA:       ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  ETA:       ", Style::default().fg(theme.text_dim)),
             Span::raw(format_eta(torrent.eta_seconds)),
         ]),
     ];
@@ -151,12 +158,14 @@ fn render_stats_tab(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .title(" Stats ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border)),
     );
     f.render_widget(stats, area);
 }
 
 fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let torrent = match app.selected_torrent() {
         Some(t) => t,
         None => return,
@@ -173,11 +182,11 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  Info Hash:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&torrent.info_hash, Style::default().fg(Color::Cyan)),
+            Span::styled("  Info Hash:    ", Style::default().fg(theme.text_dim)),
+            Span::styled(&torrent.info_hash, Style::default().fg(theme.accent)),
         ]),
         Line::from(vec![
-            Span::styled("  Uploaded:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Uploaded:     ", Style::default().fg(theme.text_dim)),
             Span::raw(format!(
                 "{}  (ratio: {})",
                 format_size(torrent.uploaded_bytes),
@@ -188,7 +197,7 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
 
     if let Some(pl) = torrent.piece_length {
         lines.push(Line::from(vec![
-            Span::styled("  Piece Size:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Piece Size:   ", Style::default().fg(theme.text_dim)),
             Span::raw(format_size(pl as u64)),
         ]));
     }
@@ -196,12 +205,12 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  Trackers:",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.text_dim),
     )));
     if torrent.trackers.is_empty() {
         lines.push(Line::from(Span::styled(
             "    (DHT only)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.text_dim),
         )));
     } else {
         for tracker in &torrent.trackers {
@@ -213,12 +222,14 @@ fn render_info_tab(f: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .title(" Info ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border)),
     );
     f.render_widget(info_widget, area);
 }
 
 fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let torrent = match app.selected_torrent() {
         Some(t) => t,
         None => return,
@@ -227,12 +238,13 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
     if torrent.files.is_empty() {
         let placeholder =
             Paragraph::new("  No file information available yet (waiting for metadata).")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme.text_dim))
                 .block(
                     Block::default()
                         .title(" Files ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray)),
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme.border)),
                 );
         f.render_widget(placeholder, area);
         return;
@@ -246,7 +258,7 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
         } else {
             0.0
         };
-        let bar = crate::ui::progress::render_progress_bar(percent, 10);
+        let bar = render_progress_bar_styled(percent, 10, theme);
 
         let selected = app.is_file_selected(torrent_id, idx);
         let checkbox = if selected { "[\u{2713}]" } else { "[ ]" };
@@ -255,22 +267,22 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
 
         let highlight_style = if is_highlighted {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme.highlight)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
 
         let file_style = if !selected {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text_dim)
         } else {
             highlight_style
         };
 
         let checkbox_style = if selected {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme.download)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim)
         };
 
         let is_media = is_streamable_media(&file.name);
@@ -278,23 +290,24 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
         // otherwise to keep the column alignment identical.
         let media_glyph = if is_media { "\u{25B6} " } else { "  " };
         let media_glyph_style = if is_media {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent)
         } else {
             Style::default()
         };
 
-        lines.push(Line::from(vec![
-            Span::styled(if is_highlighted { "> " } else { "  " }, highlight_style),
-            Span::styled(format!("{} ", checkbox), checkbox_style),
-            Span::styled(media_glyph, media_glyph_style),
-            Span::styled(crate::ui::util::pad_to_width(&file.name, 45), file_style),
-            Span::styled(format!("{:>10}", format_size(file.size_bytes)), file_style),
-            Span::raw("  "),
-            Span::styled(
-                bar,
-                Style::default().fg(crate::ui::progress::progress_color(percent)),
-            ),
-        ]));
+        lines.push(Line::from(
+            vec![
+                Span::styled(if is_highlighted { "> " } else { "  " }, highlight_style),
+                Span::styled(format!("{} ", checkbox), checkbox_style),
+                Span::styled(media_glyph, media_glyph_style),
+                Span::styled(crate::ui::util::pad_to_width(&file.name, 45), file_style),
+                Span::styled(format!("{:>10}", format_size(file.size_bytes)), file_style),
+                Span::raw("  "),
+            ]
+            .into_iter()
+            .chain(bar.spans)
+            .collect::<Vec<_>>(),
+        ));
     }
 
     let files_widget = Paragraph::new(lines).block(
@@ -304,7 +317,8 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
                 torrent.files.len()
             ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border)),
     );
     f.render_widget(files_widget, area);
 }
@@ -319,6 +333,9 @@ fn render_files_tab(f: &mut Frame, area: Rect, app: &App) {
 /// only because both have the same length; do not use it to index the
 /// underlying vec.
 fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
+    // Owned copy up front: this function mutates `app` (scroll state) before
+    // building lines, so a borrowed `&app.theme` would not survive.
+    let theme = app.theme.clone();
     // Pull just what we need so the immutable borrow ends before we touch
     // `app` mutably to update scroll state.
     let (peer_count, peers_connected, peers_total) = match app.selected_torrent() {
@@ -330,17 +347,17 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
         let text = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Connected:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Connected:  ", Style::default().fg(theme.text_dim)),
                 Span::raw(format!("{}", peers_connected)),
             ]),
             Line::from(vec![
-                Span::styled("  Total seen: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Total seen: ", Style::default().fg(theme.text_dim)),
                 Span::raw(format!("{}", peers_total)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 "  No peers connected",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.text_dim),
             )),
         ];
 
@@ -348,7 +365,8 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .title(" Peers ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border)),
         );
         f.render_widget(peers_widget, area);
         return;
@@ -388,9 +406,9 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  Connected: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Connected: ", Style::default().fg(theme.text_dim)),
             Span::raw(format!("{}", peers_connected)),
-            Span::styled("  /  Total seen: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  /  Total seen: ", Style::default().fg(theme.text_dim)),
             Span::raw(format!("{}", peers_total)),
         ]),
         Line::from(""),
@@ -400,7 +418,7 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
                 "Address", "State", "Downloaded", "Pieces", "Errs"
             ),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )]),
     ];
@@ -415,7 +433,7 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
         let prefix = if is_selected { "> " } else { "  " };
         let style = if is_selected {
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme.highlight)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -439,7 +457,8 @@ fn render_peers_tab(f: &mut Frame, area: Rect, app: &mut App) {
         Block::default()
             .title(format!(" Peers ({}) - j/k:scroll ", peer_count))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border)),
     );
     f.render_widget(peers_widget, area);
 }

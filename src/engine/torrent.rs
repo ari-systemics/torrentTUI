@@ -27,7 +27,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ManagedTorrent, Session,
     SessionOptions, SessionPersistenceConfig, TorrentStatsState,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -63,6 +63,15 @@ const PORT_RANGE_SIZE: u16 = 10;
 /// symlink-to-huge-file OOM.
 pub(crate) const MAX_TORRENT_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Bound on a single add's wait for metadata. librqbit resolves magnets
+/// inside `Session::add_torrent` via `resolve_magnet()` with no timeout of
+/// its own, so a dead or 0-seed magnet would wait forever; healthy magnets
+/// resolve in 1–5s via DHT/trackers, and 60s generously bounds the wait. The
+/// add itself runs in a spawned task (see `run_engine`), so this only limits
+/// how long the user waits for a failure message — the engine loop stays
+/// responsive regardless.
+const METADATA_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // Throttle algorithm tuning -------------------------------------------------
 
 /// How often the throttle loop runs.
@@ -96,6 +105,14 @@ pub enum EngineInfo {
     /// keeps `http_api_base = None`, so `s` reports "Streaming API not ready
     /// yet" instead of opening a player.
     HttpApiReady { base_url: String },
+    /// One spawned add task resolved — fresh success, queue admission,
+    /// already-managed/finished, or failure; every completion path in the
+    /// `add_done_rx` arm sends exactly one. The UI pops one `pending_adds`
+    /// placeholder row per signal. Sent with `try_send`: if the 4-slot info
+    /// channel is somehow full the signal is dropped rather than blocking the
+    /// engine loop, which is safe because the matching `msg_tx` outcome
+    /// message ("Added:"/"Queued:"/"Failed…") still fires either way.
+    AddFinished,
 }
 
 #[derive(Debug)]
@@ -107,7 +124,13 @@ pub enum EngineInfo {
 /// queue and deadlock against an engine blocked pushing state. That is what the
 /// `*Many` variants are for; prefer them over loops.
 pub enum EngineCommand {
-    AddTorrent(String),
+    /// Add a magnet URI or `.torrent` path. `group` names a `[[groups]]`
+    /// entry whose dir becomes the torrent's sub-folder; `None` is a plain
+    /// add into the download dir.
+    AddTorrent {
+        source: String,
+        group: Option<String>,
+    },
     Pause(usize),
     Resume(usize),
     /// Bulk pause. Replaces a fan-out of N `Pause(id)` sends from the UI,
@@ -156,16 +179,49 @@ struct WatchCleanup {
 /// of building full peer/file lists on every 100 ms tick.
 struct ThrottleSnapshot {
     id: usize,
+    /// Carried so the download queue (keyed by info hash, never by the
+    /// recycling-prone numeric id) can test membership per tick.
+    info_hash: Id20,
     status: TorrentStatus,
     downloaded_bytes: u64,
     upload_speed: u64,
+}
+
+/// Result of one spawned add task, reported back to the engine loop over the
+/// `add_done` channel. The group travels with the outcome (rather than being
+/// remembered loop-side) because several adds can be in flight at once.
+struct AddOutcome {
+    group: Option<String>,
+    /// What `TorrentEngine::add_torrent` returned: (id, handle, already_managed).
+    result: Result<(usize, ManagedTorrentHandle, bool)>,
+}
+
+/// Bound a fallible future with a deadline, mapping elapse to an error.
+/// librqbit gives magnet adds no deadline of its own — `Session::add_torrent`
+/// blocks inside `resolve_magnet` until some peer serves the metadata, which
+/// for a dead or 0-seed magnet is never — so the timeout has to live on our
+/// side. Generic over the future so tests can exercise it without a `Session`.
+async fn with_timeout<T, F>(timeout: std::time::Duration, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => anyhow::bail!(
+            "metadata fetch timed out after {}s (no peers had it)",
+            timeout.as_secs()
+        ),
+    }
 }
 
 /// Thin wrapper over librqbit's `Session` — lookups, passthroughs and snapshot
 /// building, with no state of its own. Everything mutable (user-paused set,
 /// throttle buckets, display caches) lives in `run_engine`'s locals, so a
 /// second `TorrentEngine` would be a session view with no throttling attached
-/// rather than a second engine.
+/// rather than a second engine. `Clone` hands out exactly such a view: the
+/// spawned add tasks (see `run_engine`) each get one so the engine loop never
+/// awaits a blocking librqbit add inline.
+#[derive(Clone)]
 pub struct TorrentEngine {
     session: Arc<Session>,
 }
@@ -197,10 +253,21 @@ impl TorrentEngine {
     /// the existing torrent instead of adding one, which is what lets the
     /// caller say "already downloaded" rather than reporting a fresh add.
     ///
+    /// `sub_folder` is a validated `[[groups]]` dir, joined under the
+    /// session's output folder by librqbit (its `AddTorrentOptions::sub_folder`
+    /// rejects absolute paths by construction here — the config loader has
+    /// already dropped those). Groups are assigned at add time only: librqbit
+    /// cannot move a torrent's files afterwards, so there is deliberately no
+    /// re-group command.
+    ///
     /// Anything not starting with `magnet:?` is treated as a filesystem path
     /// and size-capped before reading, so a symlink pointing at something
     /// enormous cannot be read into memory.
-    pub async fn add_torrent(&self, source: &str) -> Result<(usize, ManagedTorrentHandle, bool)> {
+    pub async fn add_torrent(
+        &self,
+        source: &str,
+        sub_folder: Option<&str>,
+    ) -> Result<(usize, ManagedTorrentHandle, bool)> {
         let source = source.trim();
         let add_torrent = if source.starts_with("magnet:?") {
             AddTorrent::from_url(source)
@@ -233,6 +300,7 @@ impl TorrentEngine {
                 add_torrent,
                 Some(AddTorrentOptions {
                     overwrite: true,
+                    sub_folder: sub_folder.map(str::to_string),
                     ..Default::default()
                 }),
             )
@@ -333,6 +401,7 @@ impl TorrentEngine {
                     .unwrap_or(0);
                 ThrottleSnapshot {
                     id,
+                    info_hash: handle.info_hash(),
                     status: derive_status(&stats),
                     downloaded_bytes: stats.progress_bytes,
                     upload_speed,
@@ -348,7 +417,19 @@ impl TorrentEngine {
     /// torrents get empty placeholders. The full path was hot: ~5000
     /// FileInfo + PeerInfo allocations per tick at 50 torrents × 100 files
     /// × 50 peers, of which the UI only ever displayed one torrent's worth.
-    pub fn get_all_torrents(&self, detail_id: Option<usize>) -> Vec<TorrentInfo> {
+    ///
+    /// `queued` is the engine's download queue; members report
+    /// `TorrentStatus::Queued` regardless of their underlying (paused) state,
+    /// so the user can tell a queue hold from their own pause.
+    ///
+    /// `group_labels` is the engine's info-hash → group-name map (backed by
+    /// the `groups.json` sidecar); a hit lands in `TorrentInfo.group`.
+    pub fn get_all_torrents(
+        &self,
+        detail_id: Option<usize>,
+        queued: &VecDeque<Id20>,
+        group_labels: &HashMap<Id20, String>,
+    ) -> Vec<TorrentInfo> {
         self.session.with_torrents(|iter| {
             iter.map(|(id, handle)| {
                 let stats = handle.stats();
@@ -361,7 +442,13 @@ impl TorrentEngine {
                 let name = sanitize_display(&raw_name);
 
                 let uploaded_bytes = stats.uploaded_bytes;
-                let status = derive_status(&stats);
+                let info_hash = handle.info_hash();
+                let status = if queued.contains(&info_hash) {
+                    TorrentStatus::Queued
+                } else {
+                    derive_status(&stats)
+                };
+                let group = group_labels.get(&info_hash).cloned();
 
                 let (download_speed, upload_speed, eta_seconds, peers_connected) =
                     if let Some(ref live) = stats.live {
@@ -410,8 +497,8 @@ impl TorrentEngine {
                     Vec::new()
                 };
 
-                let info_hash = if is_detail {
-                    handle.info_hash().as_string()
+                let info_hash_str = if is_detail {
+                    info_hash.as_string()
                 } else {
                     String::new()
                 };
@@ -458,6 +545,7 @@ impl TorrentEngine {
                 TorrentInfo {
                     id,
                     name,
+                    group,
                     size_bytes: stats.total_bytes,
                     downloaded_bytes: stats.progress_bytes,
                     uploaded_bytes,
@@ -469,7 +557,7 @@ impl TorrentEngine {
                     eta_seconds,
                     files,
                     peers,
-                    info_hash,
+                    info_hash: info_hash_str,
                     trackers,
                     piece_length,
                     throttle_managed: false, // set by push_state
@@ -548,6 +636,81 @@ pub(crate) fn step_bucket(prev: i64, rate: i64, elapsed_secs: f64, bytes_delta: 
     let credit = (rate as f64 * elapsed_secs) as i64;
     let next = prev.saturating_add(credit).saturating_sub(bytes_delta);
     next.min(rate.saturating_mul(BURST_MULTIPLIER))
+}
+
+/// Whether a fresh add must wait in the queue: a cap is configured and the
+/// active count has reached it. `cap == 0` means unlimited — the pre-queue
+/// behavior where every add starts immediately.
+pub(crate) fn should_queue(active: usize, cap: usize) -> bool {
+    cap > 0 && active >= cap
+}
+
+/// How many queued torrents may start this tick: the number of free slots,
+/// bounded by the queue length. Pure helper so the promotion loop's
+/// arithmetic is testable. `cap == 0` disables the queue entirely, hence 0.
+pub(crate) fn promotion_count(active: usize, cap: usize, queued_len: usize) -> usize {
+    if cap == 0 {
+        0
+    } else {
+        cap.saturating_sub(active).min(queued_len)
+    }
+}
+
+/// Torrents occupying a download slot right now: live and downloading, or
+/// initializing (`FetchingMetadata` — a magnet on its way to downloading),
+/// and not paused by the user, either throttle bucket, or the queue. The
+/// status condition mirrors `derive_status`, so the cap tracks what the
+/// table shows; counting initializing torrents is what stops a burst of
+/// magnet adds from all starting at once before any of them reports
+/// `Downloading`. Takes an iterator so the tick's admission pass can count
+/// only the subset of torrents it has already made a decision for.
+fn count_active_downloads<'a>(
+    snapshot: impl IntoIterator<Item = &'a ThrottleSnapshot>,
+    user_paused: &HashSet<usize>,
+    throttle_paused: &HashSet<usize>,
+    ul_throttle_paused: &HashSet<usize>,
+    queued_ids: &HashSet<usize>,
+) -> usize {
+    snapshot
+        .into_iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                TorrentStatus::Downloading | TorrentStatus::FetchingMetadata
+            ) && !user_paused.contains(&t.id)
+                && !throttle_paused.contains(&t.id)
+                && !ul_throttle_paused.contains(&t.id)
+                && !queued_ids.contains(&t.id)
+        })
+        .count()
+}
+
+/// Ids of the snapshot torrents currently in the download queue. The queue
+/// itself is keyed by info hash; this is the per-tick projection onto ids
+/// for the id-keyed throttle bookkeeping.
+fn queued_ids_in(snapshot: &[ThrottleSnapshot], queued: &VecDeque<Id20>) -> HashSet<usize> {
+    snapshot
+        .iter()
+        .filter(|t| queued.contains(&t.info_hash))
+        .map(|t| t.id)
+        .collect()
+}
+
+/// Queued torrents whose hold hasn't stuck yet: librqbit's `pause` bails on
+/// an initializing torrent, so a queued magnet keeps fetching (and then
+/// downloading) until the per-tick reconcile gets it paused. While it runs
+/// it still occupies a slot, so admission and promotion must count it.
+fn queued_pending_count(snapshot: &[ThrottleSnapshot], queued: &VecDeque<Id20>) -> usize {
+    snapshot
+        .iter()
+        .filter(|t| {
+            queued.contains(&t.info_hash)
+                && matches!(
+                    t.status,
+                    TorrentStatus::FetchingMetadata | TorrentStatus::Downloading
+                )
+        })
+        .count()
 }
 
 /// Build the HTTP stream URL the UI hands to external media players. Pure so
@@ -699,6 +862,61 @@ fn spawn_watch_cleanup(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Group labels
+// ---------------------------------------------------------------------------
+
+/// Path of the group-label sidecar: a JSON object of info-hash-hex → group
+/// name, one entry per torrent added under a `[[groups]]` group. librqbit's
+/// own session persistence records the output folder but not the *group name*
+/// the user picked, so the label lives here, next to `config.toml`.
+fn group_labels_path() -> PathBuf {
+    Config::config_dir().join("groups.json")
+}
+
+/// Load the sidecar. A missing file is the normal first-run case and yields
+/// an empty map; a corrupt one is dropped with a warning rather than failing
+/// engine startup — worst case the Group column shows `·` until the next add.
+/// Entries with unparseable hashes are skipped individually.
+fn load_group_labels(path: &std::path::Path) -> HashMap<Id20, String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    match serde_json::from_str::<HashMap<String, String>>(&content) {
+        Ok(raw) => raw
+            .into_iter()
+            .filter_map(|(hash, group)| hash.parse::<Id20>().ok().map(|h| (h, group)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Ignoring corrupt group labels file {:?}: {}", path, e);
+            HashMap::new()
+        }
+    }
+}
+
+/// Persist the sidecar. Atomic write (tmp + fsync + rename), the same pattern
+/// as `Config::save`: a power loss mid-write must not zero the file and
+/// silently ungroup every torrent on the next launch.
+fn save_group_labels(path: &std::path::Path, labels: &HashMap<Id20, String>) -> Result<()> {
+    let raw: HashMap<String, String> = labels
+        .iter()
+        .map(|(hash, group)| (hash.as_string(), group.clone()))
+        .collect();
+    let content = serde_json::to_string_pretty(&raw)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// The engine task. Owns the librqbit session, all throttle bookkeeping, and
 /// the watch folder, and runs until it receives `Shutdown` or the command
 /// channel closes — both are normal exits that return `Ok`.
@@ -838,7 +1056,13 @@ pub async fn run_engine(
     throttle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let enable_notifications = config.ui.enable_notifications;
+    let max_concurrent_downloads = config.general.max_concurrent_downloads;
     let mut cmd_rx = cmd_rx;
+
+    // Completion channel for spawned add tasks. `EngineCommand::AddTorrent`
+    // only validates and dispatches; the blocking librqbit add runs off-loop
+    // and reports back here, so a dead magnet can never wedge the loop.
+    let (add_done_tx, mut add_done_rx) = mpsc::channel::<AddOutcome>(8);
 
     let mut finished_set: HashSet<usize> = HashSet::new();
 
@@ -873,6 +1097,57 @@ pub async fn run_engine(
     // per-tick snapshot skips files/peers/trackers entirely.
     let mut detail_torrent_id: Option<usize> = None;
 
+    // Download queue: info hashes of torrents paused because
+    // `max_concurrent_downloads` was reached, in FIFO order. Keyed by hash,
+    // never by id — librqbit hands deleted ids back out, which would promote
+    // the wrong torrent. This is a *third* pause category alongside
+    // `user_paused` and `throttle_paused` and must stay disjoint from both:
+    // the throttle duty cycle never touches queued torrents, and any explicit
+    // user pause/resume strips queue membership (user intent wins). Membership
+    // is in-memory only — librqbit persists the paused state but not *why* —
+    // so after a restart nothing is queued until the tick re-admits whatever
+    // comes back live over the cap.
+    let mut queued: VecDeque<Id20> = VecDeque::new();
+    // Hashes the engine has already made a queue decision for. The watch
+    // folder and session persistence bypass `EngineCommand::AddTorrent`, so
+    // the tick admits torrents it has never seen before; remembering the seen
+    // set is what stops a user-resumed queued torrent from being re-queued on
+    // the next tick.
+    let mut seen_hashes: HashSet<Id20> = HashSet::new();
+
+    // Download groups: name → sub-folder, from the validated `[[groups]]`
+    // config entries. Resolved at add time into librqbit's
+    // `AddTorrentOptions::sub_folder`.
+    let group_dirs: HashMap<String, String> = config
+        .groups
+        .iter()
+        .map(|g| (g.name.clone(), g.dir.clone()))
+        .collect();
+    // Group labels per torrent: info hash → group name, persisted in
+    // `groups.json` because librqbit's session persistence keeps the output
+    // folder but not the group name. Pruned at startup and alongside the
+    // queue's cleanup points (delete commands, the per-tick retain), so it
+    // cannot outlive the torrent it labels. There is no re-group command on
+    // purpose: librqbit can't move a torrent's files after the add, and a
+    // label that lied about the on-disk location would be worse than none.
+    let group_labels_path = group_labels_path();
+    let mut group_labels = load_group_labels(&group_labels_path);
+    {
+        // Drop labels for torrents the restored session no longer has.
+        let present: HashSet<Id20> = engine
+            .handle_snapshot()
+            .iter()
+            .map(|(_, h)| h.info_hash())
+            .collect();
+        let before = group_labels.len();
+        group_labels.retain(|hash, _| present.contains(hash));
+        if group_labels.len() != before {
+            if let Err(e) = save_group_labels(&group_labels_path, &group_labels) {
+                tracing::warn!("Failed to save group labels: {}", e);
+            }
+        }
+    }
+
     /// Build the latest per-torrent snapshot and broadcast it to the UI. Also
     /// fires completion notifications, applies throttle-managed display
     /// overrides (effective speed + paused flag), and prunes the bookkeeping
@@ -892,9 +1167,11 @@ pub async fn run_engine(
         speed_tracker: &mut HashMap<usize, (std::time::Instant, u64, u64)>,
         enable_notifications: bool,
         detail_id: Option<usize>,
+        queued: &VecDeque<Id20>,
+        group_labels: &HashMap<Id20, String>,
     ) {
         let now = std::time::Instant::now();
-        let mut torrents = engine.get_all_torrents(detail_id);
+        let mut torrents = engine.get_all_torrents(detail_id, queued, group_labels);
 
         let current_ids: HashSet<usize> = torrents.iter().map(|t| t.id).collect();
         finished_set.retain(|id| current_ids.contains(id));
@@ -1005,34 +1282,60 @@ pub async fn run_engine(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(EngineCommand::AddTorrent(source)) => {
-                        match engine.add_torrent(&source).await {
-                            Ok((id, handle, already_managed)) => {
-                                let stats = handle.stats();
-                                let raw = handle.name().unwrap_or_else(|| "Unknown".to_string());
-                                let name = sanitize_display(&raw);
-                                if already_managed || stats.finished {
-                                    let _ = msg_tx
-                                        .send(format!("\"{}\" already downloaded", name))
-                                        .await;
-                                    if stats.finished {
-                                        finished_set.insert(id);
-                                    }
-                                } else {
-                                    tracing::info!("Added torrent {}", id);
-                                }
-                            }
-                            Err(e) => {
-                                let _ = msg_tx.send(format!("Failed to add torrent: {}", e)).await;
-                                tracing::error!("Failed to add torrent: {}", e);
-                            }
-                        }
+                    Some(EngineCommand::AddTorrent { source, group }) => {
+                        // Resolve the group to its configured sub-folder. An
+                        // unknown name rejects the add outright — silently
+                        // falling back to the download dir would dump the
+                        // torrent somewhere the user didn't ask for. This check
+                        // stays synchronous: it's cheap and needs no session.
+                        let sub_folder = match group.as_deref() {
+                            None => Some(None),
+                            Some(name) => group_dirs.get(name).map(|dir| Some(dir.as_str())),
+                        };
+                        let Some(sub_folder) = sub_folder else {
+                            let name = group.unwrap_or_default();
+                            let _ = msg_tx.send(format!("Unknown group '{}'", name)).await;
+                            tracing::warn!("Rejected add: unknown group '{}'", name);
+                            continue;
+                        };
+                        // INVARIANT: never await `engine.add_torrent` inline in
+                        // this loop. For a magnet, librqbit's
+                        // `Session::add_torrent` blocks inside
+                        // `resolve_magnet()` with no timeout, so a dead or
+                        // 0-seed magnet awaited here froze the entire engine —
+                        // ticks stopped, state pushes stalled, and every later
+                        // command (including Shutdown) queued up unprocessed.
+                        // Adds ALWAYS go through a spawned task plus the
+                        // `add_done` completion channel; the post-add work
+                        // (naming, queue admission, messages) runs in the
+                        // `add_done_rx` arm below, where admission counting
+                        // also happens — at completion time, not here, because
+                        // state may have changed while metadata was in flight.
+                        let add_engine = engine.clone();
+                        let add_done_tx = add_done_tx.clone();
+                        let sub_folder = sub_folder.map(str::to_string);
+                        tokio::spawn(async move {
+                            let result = with_timeout(
+                                METADATA_ADD_TIMEOUT,
+                                add_engine.add_torrent(&source, sub_folder.as_deref()),
+                            )
+                            .await;
+                            // A send error means the engine is shutting down;
+                            // the outcome is moot by then.
+                            let _ = add_done_tx.send(AddOutcome { group, result }).await;
+                        });
                     }
                     Some(EngineCommand::Pause(id)) => {
                         if let Some(handle) = engine.get_handle(id) {
                             if let Err(e) = engine.pause(&handle).await {
                                 tracing::error!("Failed to pause torrent {}: {}", id, e);
                             }
+                        }
+                        // A user pause of a queued torrent converts it to a
+                        // plain user pause — the queue must stay disjoint from
+                        // `user_paused`.
+                        if let Some(hash) = engine.info_hash(id) {
+                            queued.retain(|h| *h != hash);
                         }
                         user_paused.insert(id);
                         throttle_paused.remove(&id);
@@ -1049,6 +1352,12 @@ pub async fn run_engine(
                             if let Err(e) = engine.unpause(&handle).await {
                                 tracing::error!("Failed to resume torrent {}: {}", id, e);
                             }
+                        }
+                        // Explicit resume wins over the queue: the torrent
+                        // leaves the FIFO and simply occupies a slot (possibly
+                        // over cap) until it finishes or is paused again.
+                        if let Some(hash) = engine.info_hash(id) {
+                            queued.retain(|h| *h != hash);
                         }
                         user_paused.remove(&id);
                         throttle_paused.remove(&id);
@@ -1076,6 +1385,7 @@ pub async fn run_engine(
                         // stay quiet rather than surfacing librqbit's
                         // "no such torrent in db".
                         if let Some(hash) = engine.info_hash(id) {
+                            queued.retain(|h| *h != hash);
                             if let Err(e) = engine
                                 .delete(TorrentIdOrHash::Hash(hash), delete_files)
                                 .await
@@ -1098,6 +1408,13 @@ pub async fn run_engine(
                                     HashSet::from([hash.as_string()]),
                                     &msg_tx,
                                 );
+                                if group_labels.remove(&hash).is_some() {
+                                    if let Err(e) =
+                                        save_group_labels(&group_labels_path, &group_labels)
+                                    {
+                                        tracing::warn!("Failed to save group labels: {}", e);
+                                    }
+                                }
                             }
                         }
                         finished_set.remove(&id);
@@ -1122,6 +1439,9 @@ pub async fn run_engine(
                                 if let Err(e) = engine.pause(handle).await {
                                     tracing::error!("Failed to pause torrent {}: {}", id, e);
                                 }
+                                // User pause strips queue membership — see
+                                // `Pause`.
+                                queued.retain(|h| *h != handle.info_hash());
                             }
                             user_paused.insert(id);
                             throttle_paused.remove(&id);
@@ -1146,6 +1466,9 @@ pub async fn run_engine(
                                 if let Err(e) = engine.unpause(handle).await {
                                     tracing::error!("Failed to resume torrent {}: {}", id, e);
                                 }
+                                // Explicit resume wins over the queue — see
+                                // `Resume`.
+                                queued.retain(|h| *h != handle.info_hash());
                             }
                             user_paused.remove(&id);
                             throttle_paused.remove(&id);
@@ -1176,9 +1499,11 @@ pub async fn run_engine(
                         // loop could pick up a recycled id's new torrent.
                         let batch: HashMap<usize, Id20> = engine.info_hashes(&ids);
                         let mut deleted_hashes: HashSet<String> = HashSet::new();
+                        let mut labels_changed = false;
                         let mut failures = 0usize;
                         for id in ids {
                             if let Some(&hash) = batch.get(&id) {
+                                queued.retain(|h| *h != hash);
                                 if let Err(e) = engine
                                     .delete(TorrentIdOrHash::Hash(hash), delete_files)
                                     .await
@@ -1188,6 +1513,12 @@ pub async fn run_engine(
                                 }
                                 if !engine.is_present(hash) {
                                     deleted_hashes.insert(hash.as_string());
+                                    // The label goes with the torrent, whatever
+                                    // the file-deletion outcome was — same
+                                    // discipline as the queue's `retain` above.
+                                    if group_labels.remove(&hash).is_some() {
+                                        labels_changed = true;
+                                    }
                                 }
                             }
                             finished_set.remove(&id);
@@ -1204,6 +1535,11 @@ pub async fn run_engine(
                         // One cleanup pass and one failure message for the
                         // whole batch — see `spawn_watch_cleanup` on why the
                         // message channel must not be fed per-item.
+                        if labels_changed {
+                            if let Err(e) = save_group_labels(&group_labels_path, &group_labels) {
+                                tracing::warn!("Failed to save group labels: {}", e);
+                            }
+                        }
                         spawn_watch_cleanup(
                             &mut cleanup_tasks,
                             &watch_cleanup,
@@ -1221,6 +1557,9 @@ pub async fn run_engine(
                             let _ = engine.pause(&handle).await;
                             user_paused.insert(id);
                         }
+                        // Everything is now user-paused; the queue must stay
+                        // disjoint from `user_paused`, so it empties.
+                        queued.clear();
                         throttle_paused.clear();
                         ul_throttle_paused.clear();
                         throttle_managed.clear();
@@ -1239,6 +1578,8 @@ pub async fn run_engine(
                                 throttle_managed.insert(id);
                             }
                         }
+                        // Explicit resume wins over the queue — see `Resume`.
+                        queued.clear();
                         throttle_paused.clear();
                         ul_throttle_paused.clear();
                         if !throttling {
@@ -1304,10 +1645,113 @@ pub async fn run_engine(
                         break;
                     }
                 }
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id, &queued, &group_labels).await;
+            }
+            Some(outcome) = add_done_rx.recv() => {
+                // A spawned add task finished (see the AddTorrent arm for why
+                // adds never run inline). All post-add work lives here.
+                let AddOutcome { group, result } = outcome;
+                match result {
+                    Ok((id, handle, already_managed)) => {
+                        let stats = handle.stats();
+                        let raw = handle.name().unwrap_or_else(|| "Unknown".to_string());
+                        let name = sanitize_display(&raw);
+                        if already_managed || stats.finished {
+                            let _ = msg_tx
+                                .send(format!("\"{}\" already downloaded", name))
+                                .await;
+                            if stats.finished {
+                                finished_set.insert(id);
+                            }
+                        } else {
+                            let hash = handle.info_hash();
+                            // The tick's admission only looks at
+                            // unseen hashes; this one was decided here.
+                            seen_hashes.insert(hash);
+                            // Record the label on a fresh grouped add
+                            // only — re-adding an existing torrent must
+                            // not relabel it (the files stay put).
+                            if let Some(ref group_name) = group {
+                                group_labels.insert(hash, group_name.clone());
+                                if let Err(e) =
+                                    save_group_labels(&group_labels_path, &group_labels)
+                                {
+                                    tracing::warn!("Failed to save group labels: {}", e);
+                                }
+                            }
+                            // Count occupied slots *now*, at completion time —
+                            // state may have changed while the metadata was in
+                            // flight, and concurrent adds must each re-count so
+                            // none counts against its own admission. Only worth
+                            // the snapshot when a cap is configured.
+                            let active_before_add = if max_concurrent_downloads > 0 {
+                                let snapshot = engine.throttle_snapshot();
+                                let queued_ids = queued_ids_in(&snapshot, &queued);
+                                count_active_downloads(
+                                    &snapshot,
+                                    &user_paused,
+                                    &throttle_paused,
+                                    &ul_throttle_paused,
+                                    &queued_ids,
+                                ) + queued_pending_count(&snapshot, &queued)
+                            } else {
+                                0
+                            };
+                            if should_queue(active_before_add, max_concurrent_downloads) {
+                                if let Err(e) = engine.pause(&handle).await {
+                                    tracing::error!(
+                                        "Failed to pause queued torrent {}: {}",
+                                        id,
+                                        e
+                                    );
+                                }
+                                queued.push_back(hash);
+                                let _ = msg_tx
+                                    .send(format!(
+                                        "Queued: \"{}\" (position {})",
+                                        name,
+                                        queued.len()
+                                    ))
+                                    .await;
+                            } else {
+                                // The UI said "Adding: …" at dispatch; this is
+                                // the real confirmation that the add landed.
+                                let _ = msg_tx.send(format!("Added: \"{}\"", name)).await;
+                            }
+                            tracing::info!("Added torrent {}", id);
+                        }
+                    }
+                    Err(e) => {
+                        // Timeout errors land here too — a dead magnet surfaces
+                        // as an ordinary add failure after METADATA_ADD_TIMEOUT.
+                        let _ = msg_tx.send(format!("Failed to add torrent: {}", e)).await;
+                        tracing::error!("Failed to add torrent: {}", e);
+                    }
+                }
+                // Every path above (success, queued, already-managed, error)
+                // lands here, so the UI can drop one "Adding…" placeholder
+                // row per completed add. try_send: a full info channel must
+                // never block the engine loop, and a dropped signal only
+                // leaves the row on screen — the msg_tx outcome message
+                // above still reaches the user.
+                if let Err(e) = info_tx.try_send(EngineInfo::AddFinished) {
+                    tracing::warn!("AddFinished send dropped (channel full or UI gone): {}", e);
+                }
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id, &queued, &group_labels).await;
             }
             _ = throttle_tick.tick() => {
                 let throttling = download_limit_bps > 0 || upload_limit_bps > 0;
+                let queue_enabled = max_concurrent_downloads > 0;
+                // Lightweight snapshot avoids the full peer/file allocation
+                // path that dominates the cost of get_all_torrents. One
+                // snapshot serves both the throttle and the download queue;
+                // with neither active the tick only pushes state, as before.
+                let snapshot =
+                    (throttling || queue_enabled).then(|| engine.throttle_snapshot());
+                let mut queued_ids = snapshot
+                    .as_ref()
+                    .map(|s| queued_ids_in(s, &queued))
+                    .unwrap_or_default();
                 if throttling {
                     let now = std::time::Instant::now();
                     // Clamp at 1s so a system suspend-resume can't credit
@@ -1320,17 +1764,21 @@ pub async fn run_engine(
                         .min(1.0);
                     last_throttle_tick = now;
 
-                    // Lightweight snapshot avoids the full peer/file allocation
-                    // path that dominates the cost of get_all_torrents.
-                    let snapshot = engine.throttle_snapshot();
+                    // Always Some: the snapshot exists whenever throttling (or
+                    // the queue) is on.
+                    let snapshot = snapshot.as_ref().unwrap();
                     // O(1) handle lookup instead of O(N) get_handle per call.
                     let handle_map: HashMap<usize, ManagedTorrentHandle> =
                         engine.handle_snapshot().into_iter().collect();
 
-                    for t in &snapshot {
+                    for t in snapshot {
+                        // Queued torrents are held paused by the queue; the
+                        // duty cycle must never adopt (and thereby later
+                        // resume) them — the pause categories stay disjoint.
                         if matches!(t.status, TorrentStatus::Downloading)
                             && !user_paused.contains(&t.id)
                             && !throttle_managed.contains(&t.id)
+                            && !queued_ids.contains(&t.id)
                         {
                             throttle_managed.insert(t.id);
                             per_torrent_prev_bytes.entry(t.id).or_insert(t.downloaded_bytes);
@@ -1348,7 +1796,7 @@ pub async fn run_engine(
                         let unpause_threshold =
                             (per_torrent_limit as f64 * UNPAUSE_HYSTERESIS) as i64;
 
-                        for t in &snapshot {
+                        for t in snapshot {
                             if !throttle_managed.contains(&t.id)
                                 || user_paused.contains(&t.id)
                                 || matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding)
@@ -1427,7 +1875,7 @@ pub async fn run_engine(
                             (upload_limit_bps as f64 * UNPAUSE_HYSTERESIS) as i64;
 
                         if ul_tokens < 0 {
-                            for t in &snapshot {
+                            for t in snapshot {
                                 // A finished torrent is the only kind that is
                                 // purely uploading, so the upload cap has to
                                 // cover it or it does nothing for seeding.
@@ -1439,6 +1887,7 @@ pub async fn run_engine(
                                 ) && !user_paused.contains(&t.id)
                                     && !ul_throttle_paused.contains(&t.id)
                                     && !throttle_paused.contains(&t.id)
+                                    && !queued_ids.contains(&t.id)
                                 {
                                     if let Some(handle) = handle_map.get(&t.id) {
                                         let _ = engine.pause(handle).await;
@@ -1454,7 +1903,7 @@ pub async fn run_engine(
                             // still overdrawn. Releasing from the shared set
                             // used to hand back torrents the download limit had
                             // just paused, ten times a second.
-                            for t in &snapshot {
+                            for t in snapshot {
                                 if ul_throttle_paused.contains(&t.id)
                                     && !user_paused.contains(&t.id)
                                     && per_torrent_tokens.get(&t.id).copied().unwrap_or(0) >= 0
@@ -1469,10 +1918,15 @@ pub async fn run_engine(
                         }
                     }
 
-                    for t in &snapshot {
+                    for t in snapshot {
                         if matches!(t.status, TorrentStatus::Complete | TorrentStatus::Seeding) {
                             throttle_managed.remove(&t.id);
                             throttle_paused.remove(&t.id);
+                            // Finished torrents hold no download slot, so they
+                            // leave the queue too (shouldn't happen — queued
+                            // torrents are paused — but a persistence recheck
+                            // can surprise).
+                            queued.retain(|h| *h != t.info_hash);
                             per_torrent_tokens.remove(&t.id);
                             per_torrent_prev_bytes.remove(&t.id);
                             per_torrent_last_change.remove(&t.id);
@@ -1491,7 +1945,140 @@ pub async fn run_engine(
                     per_torrent_last_change.retain(|id, _| current_ids.contains(id));
                 }
 
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id).await;
+                if queue_enabled {
+                    // Always Some — see the snapshot construction above.
+                    let snapshot = snapshot.as_ref().unwrap();
+
+                    // Reconcile the hold: librqbit's `pause` bails on an
+                    // initializing torrent ("torrent is initializing, can't
+                    // pause"), so a queued magnet can't be stopped while it
+                    // fetches metadata. Retry every tick until the hold
+                    // sticks.
+                    for t in snapshot {
+                        if queued.contains(&t.info_hash)
+                            && matches!(
+                                t.status,
+                                TorrentStatus::FetchingMetadata | TorrentStatus::Downloading
+                            )
+                        {
+                            if let Some(handle) =
+                                engine.session().get(TorrentIdOrHash::Hash(t.info_hash))
+                            {
+                                let _ = engine.pause(&handle).await;
+                            }
+                        }
+                    }
+                    // Until the hold sticks the torrent is still coming up,
+                    // so it keeps occupying its slot in the counts below.
+                    let queued_pending = queued_pending_count(snapshot, &queued);
+
+                    // Admission: torrents that bypassed the AddTorrent command
+                    // (the watch folder adds straight into the session, and
+                    // persistence restore revives whatever was live) get
+                    // exactly one queue decision, on the first tick they
+                    // appear. `active` counts only *seen* torrents so a fresh
+                    // arrival never counts against its own admission, and
+                    // remembering the decision is what stops a user-resumed
+                    // queued torrent from being re-queued on the next tick.
+                    let mut active = count_active_downloads(
+                        snapshot.iter().filter(|t| seen_hashes.contains(&t.info_hash)),
+                        &user_paused,
+                        &throttle_paused,
+                        &ul_throttle_paused,
+                        &queued_ids,
+                    ) + queued_pending;
+                    for t in snapshot {
+                        if !seen_hashes.insert(t.info_hash) {
+                            continue;
+                        }
+                        // Only live, unfinished torrents compete for slots; a
+                        // paused, errored or finished arrival stays as it is.
+                        if !matches!(
+                            t.status,
+                            TorrentStatus::FetchingMetadata | TorrentStatus::Downloading
+                        ) {
+                            continue;
+                        }
+                        if should_queue(active, max_concurrent_downloads) {
+                            if let Some(handle) =
+                                engine.session().get(TorrentIdOrHash::Hash(t.info_hash))
+                            {
+                                let _ = engine.pause(&handle).await;
+                                queued.push_back(t.info_hash);
+                                queued_ids.insert(t.id);
+                                // Strip any throttle bookkeeping this same
+                                // tick's duty cycle already attached — queued
+                                // and throttle-managed must stay disjoint, or
+                                // the buckets would resume a torrent the queue
+                                // is holding (#47/#51 class of bug).
+                                throttle_managed.remove(&t.id);
+                                throttle_paused.remove(&t.id);
+                                ul_throttle_paused.remove(&t.id);
+                                per_torrent_tokens.remove(&t.id);
+                                let name = sanitize_display(
+                                    &handle.name().unwrap_or_else(|| "Unknown".to_string()),
+                                );
+                                let _ = msg_tx.try_send(format!(
+                                    "Queued: \"{}\" (position {})",
+                                    name,
+                                    queued.len()
+                                ));
+                            }
+                        } else {
+                            // Newly seen and left running: it occupies a slot
+                            // for the admissions decided after it this tick.
+                            active += 1;
+                        }
+                    }
+
+                    // Promotion: free slots start queued torrents FIFO. Stale
+                    // entries — deleted or finished while queued — are dropped
+                    // without consuming a slot. Lookups go by info hash, never
+                    // by the recycling-prone numeric id.
+                    let mut slots =
+                        promotion_count(active, max_concurrent_downloads, queued.len());
+                    while slots > 0 {
+                        let Some(hash) = queued.pop_front() else {
+                            break;
+                        };
+                        let Some(handle) = engine.session().get(TorrentIdOrHash::Hash(hash))
+                        else {
+                            continue;
+                        };
+                        if handle.stats().finished {
+                            continue;
+                        }
+                        let id = handle.id();
+                        if let Err(e) = engine.unpause(&handle).await {
+                            tracing::error!("Failed to start queued torrent {}: {}", id, e);
+                            continue;
+                        }
+                        if throttling {
+                            throttle_managed.insert(id);
+                            per_torrent_tokens.insert(id, 0);
+                        }
+                        tracing::info!("Started queued torrent {}", id);
+                        slots -= 1;
+                    }
+
+                    // Prune queue bookkeeping of hashes whose torrent is gone
+                    // (deleted between command handling and this tick).
+                    let current_hashes: HashSet<Id20> =
+                        snapshot.iter().map(|t| t.info_hash).collect();
+                    queued.retain(|h| current_hashes.contains(h));
+                    seen_hashes.retain(|h| current_hashes.contains(h));
+                    // Group labels follow the same discipline: a label whose
+                    // torrent vanished is dead weight in the sidecar.
+                    let before = group_labels.len();
+                    group_labels.retain(|h, _| current_hashes.contains(h));
+                    if group_labels.len() != before {
+                        if let Err(e) = save_group_labels(&group_labels_path, &group_labels) {
+                            tracing::warn!("Failed to save group labels: {}", e);
+                        }
+                    }
+                }
+
+                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, &throttle_managed, download_limit_bps, &mut cached_peers, &mut cached_upload_speed, &mut speed_tracker, enable_notifications, detail_torrent_id, &queued, &group_labels).await;
             }
         }
     }
@@ -1525,6 +2112,30 @@ pub async fn run_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn with_timeout_passes_ok_and_err_through() {
+        let ok: Result<u32> =
+            with_timeout(std::time::Duration::from_secs(1), async { Ok(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+
+        let err: Result<u32> = with_timeout(std::time::Duration::from_secs(1), async {
+            anyhow::bail!("boom")
+        })
+        .await;
+        assert_eq!(err.unwrap_err().to_string(), "boom");
+    }
+
+    #[tokio::test]
+    async fn with_timeout_elapse_maps_to_metadata_error() {
+        // A future that never resolves stands in for a dead magnet (no
+        // Session in tests); the deadline must turn it into an ordinary add
+        // error, quickly.
+        let res: Result<()> =
+            with_timeout(std::time::Duration::from_millis(10), std::future::pending()).await;
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("metadata fetch timed out"), "{msg}");
+    }
 
     #[test]
     fn eta_stalled_returns_none() {
@@ -1618,5 +2229,159 @@ mod tests {
         // SocketAddr::Display brackets IPv6 hosts; the URL must keep them.
         let url = stream_url("http://[::1]:9000", 12, 4);
         assert_eq!(url, "http://[::1]:9000/torrents/12/stream/4");
+    }
+
+    /// Test snapshot builder; ties the info hash to the id so queue
+    /// projections are easy to assert on.
+    fn snap(id: usize, status: TorrentStatus) -> ThrottleSnapshot {
+        ThrottleSnapshot {
+            id,
+            info_hash: Id20::new([id as u8; 20]),
+            status,
+            downloaded_bytes: 0,
+            upload_speed: 0,
+        }
+    }
+
+    #[test]
+    fn should_queue_only_at_cap_with_cap_set() {
+        assert!(!should_queue(0, 0), "cap 0 is unlimited");
+        assert!(!should_queue(5, 0), "cap 0 is unlimited even when busy");
+        assert!(!should_queue(1, 2));
+        assert!(should_queue(2, 2));
+        assert!(should_queue(3, 2), "over cap still queues");
+    }
+
+    #[test]
+    fn promotion_count_is_free_slots_bounded_by_queue() {
+        assert_eq!(promotion_count(0, 0, 5), 0, "cap 0 disables the queue");
+        assert_eq!(promotion_count(2, 2, 5), 0, "no free slots");
+        assert_eq!(promotion_count(5, 2, 4), 0, "over cap saturates to none");
+        assert_eq!(promotion_count(1, 2, 5), 1);
+        assert_eq!(promotion_count(0, 3, 2), 2, "queue shorter than slots");
+    }
+
+    #[test]
+    fn count_active_excludes_user_throttle_and_queue_pauses() {
+        let snapshot = vec![
+            snap(0, TorrentStatus::Downloading),
+            snap(1, TorrentStatus::Downloading),
+            snap(2, TorrentStatus::Downloading),
+            snap(3, TorrentStatus::Downloading),
+            snap(4, TorrentStatus::Paused),
+            snap(5, TorrentStatus::Complete),
+            snap(6, TorrentStatus::FetchingMetadata),
+        ];
+        let user_paused = HashSet::from([1]);
+        let throttle_paused = HashSet::from([2]);
+        let ul_throttle_paused = HashSet::new();
+        let queued_ids = HashSet::from([3]);
+        // Ids 0 and 6 occupy slots: 1/2/3 are paused by the user, the
+        // download bucket and the queue respectively, and 4/5 aren't
+        // in-flight at all. Fetching metadata counts — a magnet on its way
+        // to downloading already holds its slot.
+        assert_eq!(
+            count_active_downloads(
+                &snapshot,
+                &user_paused,
+                &throttle_paused,
+                &ul_throttle_paused,
+                &queued_ids
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn count_active_can_filter_the_snapshot_first() {
+        // The tick's admission pass counts only torrents it has already made
+        // a queue decision for, so a fresh arrival never counts against
+        // itself. cap 1, one established download, one newcomer: the newcomer
+        // must queue (active among the seen is 1), not start.
+        let seen = HashSet::from([Id20::new([0u8; 20])]);
+        let snapshot = [
+            snap(0, TorrentStatus::Downloading),
+            snap(1, TorrentStatus::Downloading),
+        ];
+        let empty: HashSet<usize> = HashSet::new();
+        let active = count_active_downloads(
+            snapshot.iter().filter(|t| seen.contains(&t.info_hash)),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+        );
+        assert_eq!(active, 1);
+        assert!(should_queue(active, 1));
+    }
+
+    #[test]
+    fn queued_ids_in_projects_hashes_onto_ids() {
+        let queued: VecDeque<Id20> = VecDeque::from([Id20::new([2u8; 20])]);
+        let snapshot = vec![
+            snap(0, TorrentStatus::Paused),
+            snap(2, TorrentStatus::Paused),
+        ];
+        assert_eq!(queued_ids_in(&snapshot, &queued), HashSet::from([2]));
+    }
+
+    #[test]
+    fn queued_pending_counts_only_unpaused_holds() {
+        // A queued magnet keeps fetching until the reconcile pause sticks;
+        // that occupies a slot. Once paused (or finished) it doesn't.
+        let queued: VecDeque<Id20> = VecDeque::from([
+            Id20::new([1u8; 20]),
+            Id20::new([2u8; 20]),
+            Id20::new([3u8; 20]),
+        ]);
+        let snapshot = vec![
+            snap(0, TorrentStatus::Downloading),
+            snap(1, TorrentStatus::FetchingMetadata),
+            snap(2, TorrentStatus::Paused),
+            snap(3, TorrentStatus::Complete),
+        ];
+        assert_eq!(queued_pending_count(&snapshot, &queued), 1);
+    }
+
+    #[test]
+    fn group_labels_roundtrip_through_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groups.json");
+        let labels = HashMap::from([
+            (Id20::new([1u8; 20]), "linux-isos".to_string()),
+            (Id20::new([2u8; 20]), "movies".to_string()),
+        ]);
+        save_group_labels(&path, &labels).unwrap();
+        assert_eq!(load_group_labels(&path), labels);
+        // No tmp file may be left behind by the atomic rename.
+        assert!(!dir.path().join("groups.json.tmp").exists());
+    }
+
+    #[test]
+    fn group_labels_missing_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_group_labels(&dir.path().join("nope.json")).is_empty());
+    }
+
+    #[test]
+    fn group_labels_corrupt_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groups.json");
+        std::fs::write(&path, "not json {").unwrap();
+        assert!(load_group_labels(&path).is_empty());
+    }
+
+    #[test]
+    fn group_labels_skips_unparseable_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groups.json");
+        let valid = Id20::new([7u8; 20]);
+        std::fs::write(
+            &path,
+            format!("{{\"{}\": \"good\", \"zzzz\": \"bad\"}}", valid.as_string()),
+        )
+        .unwrap();
+        let labels = load_group_labels(&path);
+        assert_eq!(labels, HashMap::from([(valid, "good".to_string())]));
     }
 }

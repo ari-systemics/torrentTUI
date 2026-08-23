@@ -16,6 +16,10 @@ use std::fmt;
 /// means "finished" must match both; several places in the engine do.
 pub enum TorrentStatus {
     FetchingMetadata,
+    /// Paused by the download queue because `max_concurrent_downloads` is
+    /// reached; the engine starts it FIFO once a slot frees. Distinct from
+    /// `Paused`, which always means an explicit user (or throttle) pause.
+    Queued,
     Downloading,
     Paused,
     Complete,
@@ -27,6 +31,7 @@ impl fmt::Display for TorrentStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TorrentStatus::FetchingMetadata => write!(f, "Fetching Metadata"),
+            TorrentStatus::Queued => write!(f, "Queued"),
             TorrentStatus::Downloading => write!(f, "Downloading"),
             TorrentStatus::Paused => write!(f, "Paused"),
             TorrentStatus::Complete => write!(f, "Complete"),
@@ -44,6 +49,7 @@ impl TorrentStatus {
     pub fn sort_key(&self) -> (&str, &str) {
         match self {
             TorrentStatus::FetchingMetadata => ("Fetching Metadata", ""),
+            TorrentStatus::Queued => ("Queued", ""),
             TorrentStatus::Downloading => ("Downloading", ""),
             TorrentStatus::Paused => ("Paused", ""),
             TorrentStatus::Complete => ("Complete", ""),
@@ -68,6 +74,10 @@ impl TorrentStatus {
 pub struct TorrentInfo {
     pub id: usize,
     pub name: String,
+    /// Download group this torrent was added under (the `[[groups]]` name),
+    /// or `None` for an ungrouped add. Set by the engine from its `groups.json`
+    /// sidecar — librqbit's own persistence does not record the label.
+    pub group: Option<String>,
     pub size_bytes: u64,
     pub downloaded_bytes: u64,
     pub uploaded_bytes: u64,
@@ -119,6 +129,16 @@ impl TorrentInfo {
     }
 }
 
+/// Which half of the split-pane layout owns the keystrokes that are not
+/// global: `j`/`k`/`Enter`/`g` route to the focused pane while keys like
+/// `p`/`d`/`Space` always mean downloads. Only meaningful while
+/// `App::search_pane_open` is set — a closed pane can't hold focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Downloads,
+    Search,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Normal,
@@ -129,6 +149,8 @@ pub enum AppMode {
     ConfirmQuit,
     Filter,
     ThrottleInput,
+    SearchInput,
+    SearchResults,
 }
 
 #[repr(u8)]
@@ -136,12 +158,13 @@ pub enum AppMode {
 pub enum SortColumn {
     Index = 0,
     Name = 1,
-    Size = 2,
-    Progress = 3,
-    Speed = 4,
-    Peers = 5,
-    Eta = 6,
-    Status = 7,
+    Group = 2,
+    Size = 3,
+    Progress = 4,
+    Speed = 5,
+    Peers = 6,
+    Eta = 7,
+    Status = 8,
 }
 
 impl SortColumn {
@@ -157,7 +180,8 @@ impl SortColumn {
     pub fn next(self) -> Self {
         match self {
             SortColumn::Index => SortColumn::Name,
-            SortColumn::Name => SortColumn::Size,
+            SortColumn::Name => SortColumn::Group,
+            SortColumn::Group => SortColumn::Size,
             SortColumn::Size => SortColumn::Progress,
             SortColumn::Progress => SortColumn::Speed,
             SortColumn::Speed => SortColumn::Peers,
@@ -202,6 +226,7 @@ mod tests {
         TorrentInfo {
             id,
             name: format!("torrent_{}", id),
+            group: None,
             size_bytes: size,
             downloaded_bytes: downloaded,
             uploaded_bytes: 0,
@@ -251,6 +276,7 @@ mod tests {
             TorrentStatus::FetchingMetadata.to_string(),
             "Fetching Metadata"
         );
+        assert_eq!(TorrentStatus::Queued.to_string(), "Queued");
         assert_eq!(TorrentStatus::Downloading.to_string(), "Downloading");
         assert_eq!(TorrentStatus::Paused.to_string(), "Paused");
         assert_eq!(TorrentStatus::Complete.to_string(), "Complete");
@@ -265,13 +291,14 @@ mod tests {
     fn sort_column_indices() {
         assert_eq!(SortColumn::Index.column_index(), 0);
         assert_eq!(SortColumn::Name.column_index(), 1);
-        assert_eq!(SortColumn::Status.column_index(), 7);
+        assert_eq!(SortColumn::Group.column_index(), 2);
+        assert_eq!(SortColumn::Status.column_index(), 8);
     }
 
     #[test]
     fn sort_column_next_cycles() {
         let mut col = SortColumn::Index;
-        for _ in 0..8 {
+        for _ in 0..9 {
             col = col.next();
         }
         assert_eq!(col, SortColumn::Index);
@@ -300,6 +327,7 @@ mod tests {
         // in the status-column sort; it must order pairwise identically.
         let statuses = [
             TorrentStatus::FetchingMetadata,
+            TorrentStatus::Queued,
             TorrentStatus::Downloading,
             TorrentStatus::Paused,
             TorrentStatus::Complete,

@@ -1,12 +1,15 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
+use crate::ui::theme::Theme;
+
 const PLACEHOLDER: &str = "magnet:?xt=urn:btih:... or /path/to/file.torrent";
+const SEARCH_PLACEHOLDER: &str = "type a query — Enter:search  Esc:cancel";
 
 pub struct InputWidget {
     buffer: String,
@@ -56,22 +59,52 @@ impl InputWidget {
     }
 }
 
-pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget) {
-    let title = " Add Torrent (magnet link or .torrent path) ";
+pub fn render_input(f: &mut Frame, area: Rect, input: &InputWidget, theme: &Theme) {
+    render_bordered_input(
+        f,
+        area,
+        input,
+        " Add Torrent (magnet link or .torrent path) ",
+        PLACEHOLDER,
+        theme,
+    );
+}
+
+/// The same single-line prompt, retitled for the search flow.
+pub fn render_search_input(f: &mut Frame, area: Rect, input: &InputWidget, theme: &Theme) {
+    render_bordered_input(
+        f,
+        area,
+        input,
+        " Search Torrents ",
+        SEARCH_PLACEHOLDER,
+        theme,
+    );
+}
+
+fn render_bordered_input(
+    f: &mut Frame,
+    area: Rect,
+    input: &InputWidget,
+    title: &str,
+    placeholder: &str,
+    theme: &Theme,
+) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent));
 
     let line = if input.buffer.is_empty() {
         Line::from(vec![
-            Span::styled(PLACEHOLDER, Style::default().fg(Color::DarkGray)),
-            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+            Span::styled(placeholder, Style::default().fg(theme.text_dim)),
+            Span::styled("\u{2588}", Style::default().fg(theme.text)),
         ])
     } else {
         Line::from(vec![
             Span::raw(input.buffer.as_str()),
-            Span::styled("\u{2588}", Style::default().fg(Color::White)),
+            Span::styled("\u{2588}", Style::default().fg(theme.text)),
         ])
     };
 

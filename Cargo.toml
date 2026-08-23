@@ -30,6 +30,12 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "1.0"
 
+# HTTP client for the torrent-search providers (apibay, Torznab). Same rustls
+# stack librqbit already pulls in, so this adds no second TLS implementation.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Torznab (Jackett/Prowlarr) search responses are XML.
+quick-xml = { version = "0.37", features = ["serialize"] }
+
 # Utilities
 dirs = "6"
 anyhow = "1"

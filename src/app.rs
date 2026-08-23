@@ -19,11 +19,32 @@
 //! `prune_stale_state` is what stops that accumulating, and `handle_state_push`
 //! is the one entry point that runs it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::config::PlayerConfig;
-use crate::types::{AppMode, DetailTab, SortColumn, TorrentInfo, TorrentStatus};
+use crate::search::{SearchResponse, SearchResult};
+use crate::types::{AppMode, DetailTab, Pane, SortColumn, TorrentInfo, TorrentStatus};
+use crate::ui::theme::Theme;
 use ratatui::widgets::TableState;
+
+/// Depth of the header-sparkline speed histories. At the engine's 100 ms
+/// push cadence this is ~24 s of download/upload history.
+pub const SPEED_HISTORY_CAPACITY: usize = 240;
+
+/// Cap on tracked in-flight adds. Eight concurrent "Adding…" rows already
+/// overflow a small terminal; beyond that the oldest placeholder is dropped
+/// (the engine's msg_tx confirmation still reports every outcome).
+pub const PENDING_ADDS_CAPACITY: usize = 8;
+
+/// Append a speed sample to a history, dropping the oldest sample when full.
+/// A free function (not a method) so the capping logic is testable without
+/// constructing an `App`.
+pub(crate) fn push_speed_sample(history: &mut VecDeque<u64>, sample: u64) {
+    if history.len() >= SPEED_HISTORY_CAPACITY {
+        history.pop_front();
+    }
+    history.push_back(sample);
+}
 
 /// All UI-side state. Constructed once in `run_app`; every field is either
 /// derived from an engine snapshot or owned by a key handler.
@@ -95,15 +116,81 @@ pub struct App {
     /// delete dialog, which warns that deleting also removes the `.torrent`
     /// from the watch folder.
     pub watch_dir_configured: bool,
+    /// The palette every renderer draws with. Wired from `config.theme` at
+    /// startup; `Theme::default()` here is just the placeholder. `T` swaps it
+    /// for the next entry in the theme rotation.
+    pub theme: Theme,
+    /// The resolved config theme (preset + any per-key overrides), kept so
+    /// `T` can cycle back to it — cycling to a preset and back would
+    /// otherwise lose the user's overrides for the rest of the session.
+    pub config_theme: Theme,
+    /// Name of the active theme slot for the status message: `"config"` for
+    /// `config_theme`, otherwise one of `Theme::PRESET_NAMES`. Session-only —
+    /// the config file decides what launches next time.
+    pub theme_name: String,
+    /// The query behind the current search flow — shown in the results-view
+    /// title and pre-filled when `s` reopens the search prompt.
+    pub search_query: String,
+    /// Hits from the last completed search, in the order `run_search` merged
+    /// them (seeders desc, deduped). Cleared when a new search starts.
+    pub search_results: Vec<SearchResult>,
+    /// Cursor into `search_results`, kept in lockstep with `search_index`.
+    pub search_state: TableState,
+    pub search_index: usize,
+    /// True from the moment a query is dispatched until its `SearchResponse`
+    /// arrives; the results view shows the spinner while this is set.
+    pub search_in_flight: bool,
+    /// Names of the configured `[[groups]]`, poked in from the config at
+    /// startup. The results view's `g` key cycles `search_group` through
+    /// `[None] + group_names`.
+    pub group_names: Vec<String>,
+    /// Group that adds from the search results view are routed into; `None`
+    /// means "plain add into the download dir". Sticky across searches within
+    /// a session — dropping several hits for one topic into its folder is the
+    /// headline flow.
+    pub search_group: Option<String>,
+    /// Aggregate download/upload speed samples (bytes/sec, summed across all
+    /// torrents), newest last, capped at `SPEED_HISTORY_CAPACITY`. Fed by
+    /// `handle_state_push`; drawn as the two header sparklines.
+    pub down_history: VecDeque<u64>,
+    pub up_history: VecDeque<u64>,
+    /// Whether the search pane shares the main area with the downloads table.
+    /// Set by `open_search_pane` / `close_search_pane`; on a terminal too
+    /// small for the split this can be true while nothing pane-like is drawn
+    /// (see `split_active`).
+    pub search_pane_open: bool,
+    /// Which pane owns the routed keys (`j`/`k`/`Enter`/`g`). Defaults to
+    /// Downloads; `open_search_pane` moves it to Search.
+    pub focused: Pane,
+    /// Split orientation: true docks the search pane on the right (downloads
+    /// left), false stacks it below. Seeded from `config.ui.search_split`,
+    /// flipped at runtime by `|`. Session-only — never written back.
+    pub split_vertical: bool,
+    /// True only while the split layout is actually on screen: the pane is
+    /// open *and* the terminal cleared `use_split_layout`'s thresholds on the
+    /// last rendered frame. Set by the render dispatch in main.rs (same
+    /// pattern as `table_area`), so key handlers can gate focus routing on it
+    /// — a hidden pane on a small terminal must not steal `j`/`k` from the
+    /// downloads table. Tests that exercise pane routing set it by hand.
+    pub split_active: bool,
+    /// Adds dispatched to the engine that have not reported back yet, oldest
+    /// first (titles/sources exactly as given at dispatch). The metadata
+    /// fetch behind a magnet can take up to the engine's add timeout, during
+    /// which the "Adding: …" toast has long expired — these entries are what
+    /// the downloads table renders as spinner rows so an in-flight add stays
+    /// visible. Pushed by the dispatch sites, popped one per
+    /// `EngineInfo::AddFinished`; capped at `PENDING_ADDS_CAPACITY`.
+    pub pending_adds: VecDeque<String>,
 }
 
 impl App {
     /// A blank app with row 0 selected and the sort cache marked dirty.
     ///
     /// The config-derived fields (speed limits, `confirm_on_quit`,
-    /// `player_config`, `watch_dir_configured`) get placeholder values here and
-    /// are overwritten by `run_app` immediately afterwards — do not read the
-    /// real defaults off this function.
+    /// `player_config`, `watch_dir_configured`, `theme`, `config_theme`,
+    /// `theme_name`) get placeholder values here and are overwritten by
+    /// `run_app` immediately afterwards — do not read the real defaults off
+    /// this function.
     pub fn new() -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
@@ -144,6 +231,27 @@ impl App {
             player_config: PlayerConfig::default(),
             torrent_identities: HashMap::new(),
             watch_dir_configured: false,
+            theme: Theme::default(),
+            config_theme: Theme::default(),
+            theme_name: "config".to_string(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_state: {
+                let mut state = TableState::default();
+                state.select(Some(0));
+                state
+            },
+            search_index: 0,
+            search_in_flight: false,
+            group_names: Vec::new(),
+            search_group: None,
+            down_history: VecDeque::new(),
+            up_history: VecDeque::new(),
+            search_pane_open: false,
+            focused: Pane::Downloads,
+            split_vertical: true,
+            split_active: false,
+            pending_adds: VecDeque::new(),
         }
     }
 
@@ -177,6 +285,15 @@ impl App {
     /// unconditionally meant a session of idle torrents redrew the terminal ten
     /// times a second forever — and rebuilt the sort cache each time.
     pub fn handle_state_push(&mut self, torrents: Vec<TorrentInfo>) -> bool {
+        // Record the speed sample whether or not the visible rows changed —
+        // the sparkline history is a time series, not a diff — but keep it
+        // out of the change verdict below so an idle session still skips the
+        // repaint.
+        let down: u64 = torrents.iter().map(|t| t.download_speed).sum();
+        let up: u64 = torrents.iter().map(|t| t.upload_speed).sum();
+        push_speed_sample(&mut self.down_history, down);
+        push_speed_sample(&mut self.up_history, up);
+
         let changed = Self::render_state_differs(&self.torrents, &torrents);
         self.torrents = torrents;
         if !changed {
@@ -201,6 +318,7 @@ impl App {
         old.iter().zip(new.iter()).any(|(a, b)| {
             a.id != b.id
                 || a.name != b.name
+                || a.group != b.group
                 || a.status != b.status
                 || a.size_bytes != b.size_bytes
                 || a.downloaded_bytes != b.downloaded_bytes
@@ -263,6 +381,17 @@ impl App {
         self.restore_selection();
     }
 
+    /// Whether a torrent passes the (already lowercased) filter text:
+    /// case-insensitive substring on the name *or* the group name, so
+    /// `/linux` also finds every torrent grouped under "linux-isos".
+    fn matches_filter(t: &TorrentInfo, filter_lower: &str) -> bool {
+        filter_lower.is_empty()
+            || t.name.to_lowercase().contains(filter_lower)
+            || t.group
+                .as_deref()
+                .is_some_and(|g| g.to_lowercase().contains(filter_lower))
+    }
+
     fn rebuild_sort_cache(&mut self) {
         let filter_lower = self.filter_text.to_lowercase();
         // Collect indices into `self.torrents` after applying the filter.
@@ -270,13 +399,7 @@ impl App {
             .torrents
             .iter()
             .enumerate()
-            .filter(|(_, t)| {
-                if filter_lower.is_empty() {
-                    true
-                } else {
-                    t.name.to_lowercase().contains(&filter_lower)
-                }
-            })
+            .filter(|(_, t)| Self::matches_filter(t, &filter_lower))
             .map(|(i, _)| i)
             .collect();
 
@@ -311,6 +434,13 @@ impl App {
                         debug_assert!(false, "SortColumn::Name should hit the early return");
                         std::cmp::Ordering::Equal
                     }
+                    // Ungrouped sorts first: "" precedes every name byte-wise,
+                    // like the 0 values Speed/Peers give empty torrents.
+                    SortColumn::Group => ta
+                        .group
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(tb.group.as_deref().unwrap_or("")),
                     SortColumn::Size => ta.size_bytes.cmp(&tb.size_bytes),
                     SortColumn::Progress => ta
                         .progress_percent()
@@ -382,13 +512,7 @@ impl App {
         let mut torrents: Vec<&TorrentInfo> = self
             .torrents
             .iter()
-            .filter(|t| {
-                if filter_lower.is_empty() {
-                    true
-                } else {
-                    t.name.to_lowercase().contains(&filter_lower)
-                }
-            })
+            .filter(|t| Self::matches_filter(t, &filter_lower))
             .collect();
 
         if self.sort_column == SortColumn::Name {
@@ -412,6 +536,12 @@ impl App {
                     debug_assert!(false, "SortColumn::Name should hit the early return");
                     std::cmp::Ordering::Equal
                 }
+                // Ungrouped sorts first — see `rebuild_sort_cache`.
+                SortColumn::Group => a
+                    .group
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.group.as_deref().unwrap_or("")),
                 SortColumn::Size => a.size_bytes.cmp(&b.size_bytes),
                 SortColumn::Progress => a
                     .progress_percent()
@@ -594,10 +724,38 @@ impl App {
             .count()
     }
 
+    /// Torrents currently held by the download queue (engine-paused because
+    /// `max_concurrent_downloads` was reached). Rendered as `Q:<n>` in the
+    /// status bar when non-zero.
+    pub fn queued_count(&self) -> usize {
+        self.torrents
+            .iter()
+            .filter(|t| matches!(t.status, TorrentStatus::Queued))
+            .count()
+    }
+
     pub fn has_fetching_metadata(&self) -> bool {
         self.torrents
             .iter()
             .any(|t| matches!(t.status, TorrentStatus::FetchingMetadata))
+    }
+
+    /// Remember a dispatched add until the engine reports
+    /// `EngineInfo::AddFinished`. Past `PENDING_ADDS_CAPACITY` the oldest
+    /// entry is dropped — the cap only bounds a pathological burst; the
+    /// engine still confirms every add's outcome over the message channel.
+    pub fn push_pending_add(&mut self, title: String) {
+        if self.pending_adds.len() >= PENDING_ADDS_CAPACITY {
+            self.pending_adds.pop_front();
+        }
+        self.pending_adds.push_back(title);
+    }
+
+    /// The engine finished one add. Every completion path (success, queued,
+    /// already-managed, error) sends exactly one `AddFinished`, so each pop
+    /// pairs with one push.
+    pub fn pop_pending_add(&mut self) {
+        self.pending_adds.pop_front();
     }
 
     /// Show an error in the status bar for 3 seconds. Replaces any error
@@ -646,6 +804,181 @@ impl App {
 
     pub fn tick_spinner(&mut self) {
         self.spinner_tick = (self.spinner_tick + 1) % 10;
+    }
+
+    /// Advance to the next theme in the rotation — the config theme first,
+    /// then every preset in `PRESET_NAMES` order, wrapping — and announce it
+    /// in the status bar. The "config" slot (index 0) restores the resolved
+    /// config theme so per-key overrides survive a full cycle; preset slots
+    /// replace the palette wholesale. Runtime-only: nothing is written back
+    /// to `config.toml`.
+    pub fn cycle_theme(&mut self) {
+        let slot = Theme::PRESET_NAMES
+            .iter()
+            .position(|n| *n == self.theme_name)
+            .map_or(0, |i| i + 1);
+        let next = (slot + 1) % (Theme::PRESET_NAMES.len() + 1);
+        let (name, theme) = if next == 0 {
+            ("config", self.config_theme.clone())
+        } else {
+            let name = Theme::PRESET_NAMES[next - 1];
+            // Every PRESET_NAMES entry resolves by construction.
+            (name, Theme::preset(name).unwrap_or_default())
+        };
+        self.theme = theme;
+        self.theme_name = name.to_string();
+        self.set_info(format!("Theme: {name}"));
+    }
+
+    /// Open the results view for a freshly dispatched query: previous hits are
+    /// dropped and the in-flight flag drives the "Searching…" spinner until
+    /// `apply_search_response` lands. The caller owns the actual
+    /// `run_search` spawn — this is the pure state transition, so tests can
+    /// exercise it without the network.
+    ///
+    /// With the split on screen the "results view" is the pane itself, so the
+    /// mode goes back to Normal with focus on Search and the pane-aware key
+    /// routing takes over — that keeps `w`/`|` live while hits stream in.
+    /// Without the split (small terminal or pane closed) the full-area
+    /// SearchResults mode is still where the spinner and hits render.
+    pub fn begin_search(&mut self, query: String) {
+        self.search_query = query;
+        self.search_results.clear();
+        self.search_index = 0;
+        self.search_state.select(Some(0));
+        self.search_in_flight = true;
+        if self.split_active {
+            self.mode = AppMode::Normal;
+            self.focused = Pane::Search;
+        } else {
+            self.mode = AppMode::SearchResults;
+        }
+    }
+
+    /// Merge a completed `run_search` into the UI: store the hits, clear the
+    /// in-flight flag and clamp the cursor into the new bounds. Provider
+    /// failures are summarized into one status-bar error; an all-provider
+    /// strikeout still reads as "no results" rather than a wall of errors.
+    ///
+    /// The mode is only forced to SearchResults when the user is still in the
+    /// search flow — if they Esc'd back to Normal mid-search, the hits land
+    /// silently behind them instead of yanking the view back.
+    pub fn apply_search_response(&mut self, response: SearchResponse) {
+        let SearchResponse {
+            query,
+            results,
+            errors,
+        } = response;
+        self.search_in_flight = false;
+        self.search_results = results;
+        // Results only ever change wholesale here, so plain index clamping is
+        // enough — there is no per-row identity worth following.
+        if self.search_results.is_empty() {
+            self.search_index = 0;
+        } else if self.search_index >= self.search_results.len() {
+            self.search_index = self.search_results.len() - 1;
+        }
+        self.search_state.select(Some(self.search_index));
+
+        if !errors.is_empty() {
+            let summary = errors
+                .iter()
+                .map(|(provider, err)| format!("{provider}: {err}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            self.set_error(summary);
+        } else if self.search_results.is_empty() {
+            self.set_info(format!("No results for '{query}'"));
+        }
+
+        if matches!(self.mode, AppMode::SearchInput | AppMode::SearchResults) {
+            self.mode = AppMode::SearchResults;
+        }
+    }
+
+    pub fn search_next(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        self.search_index = (self.search_index + 1).min(self.search_results.len() - 1);
+        self.search_state.select(Some(self.search_index));
+    }
+
+    pub fn search_previous(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        self.search_index = self.search_index.saturating_sub(1);
+        self.search_state.select(Some(self.search_index));
+    }
+
+    pub fn selected_search_result(&self) -> Option<&SearchResult> {
+        self.search_results.get(self.search_index)
+    }
+
+    /// Cycle the target group for adds from the results view through
+    /// `[ungrouped] + group_names`, wrapping. A no-op when no groups are
+    /// configured, so `g` stays inert rather than clearing a group it can
+    /// never bring back.
+    pub fn cycle_search_group(&mut self) {
+        if self.group_names.is_empty() {
+            return;
+        }
+        self.search_group = match self.search_group.as_deref() {
+            None => Some(self.group_names[0].clone()),
+            Some(cur) => match self.group_names.iter().position(|n| n == cur) {
+                Some(i) if i + 1 < self.group_names.len() => Some(self.group_names[i + 1].clone()),
+                // Past the last configured group (or a group that vanished
+                // from the config) wraps back to ungrouped.
+                _ => None,
+            },
+        };
+    }
+
+    /// Open the search pane and hand it focus, entering the query prompt.
+    /// Pure state transition — whether the split is actually drawn depends on
+    /// the terminal size (`use_split_layout`); on a small terminal this is
+    /// indistinguishable from today's full-area search flow.
+    pub fn open_search_pane(&mut self) {
+        self.search_pane_open = true;
+        self.focused = Pane::Search;
+        self.mode = AppMode::SearchInput;
+    }
+
+    /// Close the search pane and return focus and mode to the downloads
+    /// table. The query and results are kept, so reopening picks up where
+    /// the user left off.
+    pub fn close_search_pane(&mut self) {
+        self.search_pane_open = false;
+        self.focused = Pane::Downloads;
+        self.mode = AppMode::Normal;
+    }
+
+    /// Swap which pane owns the routed keys. A no-op with the pane closed —
+    /// there is nothing to switch to, and focus must never point at a pane
+    /// that does not exist.
+    pub fn cycle_focus(&mut self) {
+        if !self.search_pane_open {
+            return;
+        }
+        self.focused = match self.focused {
+            Pane::Downloads => Pane::Search,
+            Pane::Search => Pane::Downloads,
+        };
+    }
+
+    /// Flip the split orientation (side-by-side <-> stacked). Runtime-only;
+    /// the config file's `search_split` decides the next launch.
+    pub fn toggle_split(&mut self) {
+        self.split_vertical = !self.split_vertical;
+    }
+
+    /// Whether the routed keys (`j`/`k`/`Enter`/`g`) currently belong to the
+    /// search pane. Requires `split_active` — not just an open pane — so the
+    /// small-terminal fallback (pane open but hidden) keeps downloads
+    /// navigation on the table the user actually sees.
+    pub fn search_has_focus(&self) -> bool {
+        self.split_active && self.focused == Pane::Search
     }
 
     /// Whether a file is included in the download. Returns `true` for torrents
@@ -740,6 +1073,7 @@ mod tests {
         TorrentInfo {
             id,
             name: name.to_string(),
+            group: None,
             size_bytes: size,
             downloaded_bytes: 0,
             uploaded_bytes: 0,
@@ -785,6 +1119,18 @@ mod tests {
     }
 
     #[test]
+    fn queued_count_counts_only_queued() {
+        let app = app_with_torrents(vec![
+            make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
+            make_torrent(1, "Beta", 200, TorrentStatus::Queued),
+            make_torrent(2, "Gamma", 300, TorrentStatus::Queued),
+            make_torrent(3, "Delta", 400, TorrentStatus::Paused),
+        ]);
+        assert_eq!(app.queued_count(), 2);
+        assert_eq!(app.active_count(), 1);
+    }
+
+    #[test]
     fn sorted_torrents_filter_case_insensitive() {
         let mut app = app_with_torrents(vec![
             make_torrent(0, "Alpha", 100, TorrentStatus::Downloading),
@@ -810,6 +1156,67 @@ mod tests {
             app.push_filter_char(c);
         }
         assert!(app.sorted_torrents().is_empty());
+    }
+
+    #[test]
+    fn filter_matches_group_name_case_insensitively() {
+        let mut grouped = make_torrent(0, "ubuntu.iso", 100, TorrentStatus::Downloading);
+        grouped.group = Some("Linux-ISOs".to_string());
+        let plain = make_torrent(1, "debian.iso", 200, TorrentStatus::Downloading);
+        let mut app = app_with_torrents(vec![grouped, plain]);
+        for c in "linux".chars() {
+            app.push_filter_char(c);
+        }
+        let sorted = app.sorted_torrents();
+        assert_eq!(sorted.len(), 1);
+        assert_eq!(sorted[0].name, "ubuntu.iso");
+    }
+
+    #[test]
+    fn sorted_by_group_ungrouped_first() {
+        let mut a = make_torrent(0, "A", 100, TorrentStatus::Downloading);
+        a.group = Some("movies".to_string());
+        let b = make_torrent(1, "B", 100, TorrentStatus::Downloading);
+        let mut c = make_torrent(2, "C", 100, TorrentStatus::Downloading);
+        c.group = Some("linux".to_string());
+        let mut app = app_with_torrents(vec![a, b, c]);
+        app.change_sort_column(SortColumn::Group);
+        let names: Vec<&str> = app
+            .sorted_torrents()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["B", "C", "A"]);
+    }
+
+    #[test]
+    fn group_change_triggers_a_repaint() {
+        let rows = vec![make_torrent(0, "A", 100, TorrentStatus::Downloading)];
+        let mut app = App::new();
+        app.handle_state_push(rows.clone());
+        let mut grouped = rows;
+        grouped[0].group = Some("movies".to_string());
+        assert!(app.handle_state_push(grouped), "group set is a change");
+    }
+
+    #[test]
+    fn cycle_search_group_walks_none_then_groups_then_wraps() {
+        let mut app = App::new();
+        app.group_names = vec!["linux".to_string(), "movies".to_string()];
+        assert_eq!(app.search_group, None);
+        app.cycle_search_group();
+        assert_eq!(app.search_group.as_deref(), Some("linux"));
+        app.cycle_search_group();
+        assert_eq!(app.search_group.as_deref(), Some("movies"));
+        app.cycle_search_group();
+        assert_eq!(app.search_group, None);
+    }
+
+    #[test]
+    fn cycle_search_group_is_inert_without_groups() {
+        let mut app = App::new();
+        app.cycle_search_group();
+        assert_eq!(app.search_group, None);
     }
 
     #[test]
@@ -916,6 +1323,7 @@ mod tests {
         for column in [
             SortColumn::Index,
             SortColumn::Name,
+            SortColumn::Group,
             SortColumn::Size,
             SortColumn::Progress,
             SortColumn::Status,
@@ -1170,6 +1578,35 @@ mod tests {
     }
 
     #[test]
+    fn pending_adds_push_and_pop_are_fifo() {
+        let mut app = App::new();
+        assert!(app.pending_adds.is_empty());
+        app.push_pending_add("first".to_string());
+        app.push_pending_add("second".to_string());
+        app.pop_pending_add();
+        assert_eq!(app.pending_adds.front().map(String::as_str), Some("second"));
+        app.pop_pending_add();
+        assert!(app.pending_adds.is_empty());
+        // Popping an empty queue is a no-op, not a panic: a dropped
+        // `AddFinished` can leave push/pop counts mismatched.
+        app.pop_pending_add();
+    }
+
+    #[test]
+    fn pending_adds_cap_drops_the_oldest() {
+        let mut app = App::new();
+        for i in 0..PENDING_ADDS_CAPACITY + 2 {
+            app.push_pending_add(format!("add_{i}"));
+        }
+        assert_eq!(app.pending_adds.len(), PENDING_ADDS_CAPACITY);
+        assert_eq!(
+            app.pending_adds.front().map(String::as_str),
+            Some("add_2"),
+            "the two oldest entries must have been dropped"
+        );
+    }
+
+    #[test]
     fn clamp_detail_indices_clamps_to_last_when_lists_shrink() {
         let mut t = make_torrent(0, "A", 100, TorrentStatus::Downloading);
         t.files = vec![file("a"), file("b")];
@@ -1259,5 +1696,141 @@ mod tests {
         app.clear_expired_messages();
         assert!(app.error_message.is_none());
         assert!(app.info_message.is_none());
+    }
+
+    #[test]
+    fn speed_history_caps_at_capacity_and_drops_oldest() {
+        let mut history = VecDeque::new();
+        for i in 0..SPEED_HISTORY_CAPACITY as u64 + 5 {
+            push_speed_sample(&mut history, i);
+        }
+        assert_eq!(history.len(), SPEED_HISTORY_CAPACITY);
+        // FIFO: the first five samples are gone, the newest is last.
+        assert_eq!(history.front(), Some(&5));
+        assert_eq!(history.back(), Some(&(SPEED_HISTORY_CAPACITY as u64 + 4)));
+    }
+
+    #[test]
+    fn state_push_records_aggregate_speed_samples() {
+        let mut app = App::new();
+        let mut rows = vec![
+            make_torrent(0, "A", 100, TorrentStatus::Downloading),
+            make_torrent(1, "B", 200, TorrentStatus::Downloading),
+        ];
+        rows[0].download_speed = 500;
+        rows[1].download_speed = 700;
+        rows[0].upload_speed = 60;
+        app.handle_state_push(rows.clone());
+        assert_eq!(app.down_history.back(), Some(&1200));
+        assert_eq!(app.up_history.back(), Some(&60));
+
+        // An unchanged push still appends a sample — the sparkline is a time
+        // series — but must not count as a render-worthy change.
+        assert!(!app.handle_state_push(rows));
+        assert_eq!(app.down_history.len(), 2);
+        assert_eq!(app.down_history.back(), Some(&1200));
+    }
+
+    #[test]
+    fn open_search_pane_focuses_search_and_enters_the_prompt() {
+        let mut app = App::new();
+        app.open_search_pane();
+        assert!(app.search_pane_open);
+        assert_eq!(app.focused, Pane::Search);
+        assert_eq!(app.mode, AppMode::SearchInput);
+    }
+
+    #[test]
+    fn close_search_pane_returns_focus_and_mode_to_downloads() {
+        let mut app = App::new();
+        app.open_search_pane();
+        app.close_search_pane();
+        assert!(!app.search_pane_open);
+        assert_eq!(app.focused, Pane::Downloads);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn cycle_focus_swaps_panes_only_while_open() {
+        let mut app = App::new();
+        // Closed pane: nothing to switch to, focus must not move.
+        app.cycle_focus();
+        assert_eq!(app.focused, Pane::Downloads);
+
+        app.open_search_pane();
+        app.mode = AppMode::Normal;
+        app.cycle_focus();
+        assert_eq!(app.focused, Pane::Downloads);
+        app.cycle_focus();
+        assert_eq!(app.focused, Pane::Search);
+    }
+
+    #[test]
+    fn toggle_split_flips_the_orientation() {
+        let mut app = App::new();
+        assert!(app.split_vertical);
+        app.toggle_split();
+        assert!(!app.split_vertical);
+        app.toggle_split();
+        assert!(app.split_vertical);
+    }
+
+    #[test]
+    fn search_focus_requires_the_split_on_screen() {
+        // An open-but-hidden pane (small terminal) must not claim the routed
+        // keys — the user can only see the downloads table.
+        let mut app = App::new();
+        app.open_search_pane();
+        assert!(!app.search_has_focus());
+        app.split_active = true;
+        assert!(app.search_has_focus());
+        app.cycle_focus();
+        assert!(!app.search_has_focus());
+    }
+
+    #[test]
+    fn begin_search_with_the_split_goes_to_normal_not_results_mode() {
+        // The pane is already the results view, so there is no separate
+        // full-area mode to switch into — focus moves to Search instead.
+        let mut app = App::new();
+        app.open_search_pane();
+        app.split_active = true;
+        app.begin_search("x".to_string());
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.focused, Pane::Search);
+        assert!(app.search_in_flight);
+
+        // The small-terminal path keeps the full-area SearchResults mode.
+        let mut app = App::new();
+        app.open_search_pane();
+        app.begin_search("x".to_string());
+        assert_eq!(app.mode, AppMode::SearchResults);
+    }
+
+    #[test]
+    fn search_response_with_pane_open_keeps_pane_state() {
+        let mut app = App::new();
+        app.open_search_pane();
+        app.split_active = true;
+        app.begin_search("x".to_string());
+        app.apply_search_response(SearchResponse {
+            query: "x".to_string(),
+            results: vec![SearchResult {
+                title: "A".to_string(),
+                magnet: "magnet:?xt=urn:btih:aaa".to_string(),
+                size_bytes: 1,
+                seeders: 1,
+                leechers: 0,
+                provider: "TPB".to_string(),
+            }],
+            errors: Vec::new(),
+        });
+        assert!(app.search_pane_open);
+        assert_eq!(app.focused, Pane::Search);
+        // Mode was Normal (split path), so nothing forces it to
+        // SearchResults — that switch only happens inside the search modes.
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.search_results.len(), 1);
+        assert!(!app.search_in_flight);
     }
 }

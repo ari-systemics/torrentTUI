@@ -19,6 +19,7 @@ mod app;
 mod config;
 mod engine;
 mod player;
+mod search;
 mod types;
 mod ui;
 
@@ -41,7 +42,7 @@ use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
-use types::{AppMode, DetailTab};
+use types::{AppMode, DetailTab, Pane};
 use ui::input::{validate_torrent_source, InputWidget};
 
 /// Speed-limit cap in KB/s (10 GB/s). Applied by [`clamped_speed_limit`] to
@@ -238,6 +239,15 @@ async fn run_app(
     app.confirm_on_quit = config.general.confirm_on_quit;
     app.player_config = config.player.clone();
     app.watch_dir_configured = config.general.watch_dir.is_some();
+    app.theme = config.theme.clone();
+    app.config_theme = config.theme.clone();
+    // The rotation `T` cycles through starts on the "config" slot, whatever
+    // preset/overrides that resolved to.
+    app.theme_name = "config".to_string();
+    // Group names for the search view's `g` key; dirs stay engine-side.
+    app.group_names = config.groups.iter().map(|g| g.name.clone()).collect();
+    // Split orientation for the search pane; `|` flips it at runtime.
+    app.split_vertical = config.ui.search_split == "right";
 
     if let Some(msg) = config_warning {
         app.set_error(msg);
@@ -252,6 +262,9 @@ async fn run_app(
     // Free-space probe results. Depth 1: only the newest reading matters, and
     // a full channel just means a probe is still in flight.
     let (disk_tx, mut disk_rx) = mpsc::channel::<Option<u64>>(1);
+    // Search responses. Each dispatched query produces exactly one response,
+    // so the depth only needs to absorb a few back-to-back searches.
+    let (search_tx, mut search_rx) = mpsc::channel::<search::SearchResponse>(4);
 
     let engine_config = config.clone();
     // Keep the JoinHandle so we can both detect engine death mid-run and
@@ -271,13 +284,27 @@ async fn run_app(
         let source = config::expand_tilde(source);
         match validate_torrent_source(&source) {
             Ok(()) => {
-                send_cmd(&cmd_tx, EngineCommand::AddTorrent(source), &mut app).await;
+                // The CLI add stays ungrouped — groups are picked in the TUI.
+                // Push the placeholder too: run_app's loop is what receives
+                // the engine's `AddFinished`, so the pairing holds here.
+                app.push_pending_add(source.clone());
+                send_cmd(
+                    &cmd_tx,
+                    EngineCommand::AddTorrent {
+                        source,
+                        group: None,
+                    },
+                    &mut app,
+                )
+                .await;
             }
             Err(e) => app.set_error(e),
         }
     }
 
     let download_dir = config.general.download_dir.clone();
+    // Provider list is fixed at startup; each search spawn clones it.
+    let search_providers = config.search.build_providers();
     let mut event_stream = EventStream::new();
     // Frame-rate cap for animations and timed-message aging; honors
     // `config.ui.refresh_rate_ms` (clamped to 16–1000 ms / ~60–1 FPS). Rendering
@@ -328,6 +355,10 @@ async fn run_app(
                 needs_render = true;
             }
         }
+        while let Ok(response) = search_rx.try_recv() {
+            app.apply_search_response(response);
+            needs_render = true;
+        }
 
         app.clear_expired_messages();
 
@@ -336,12 +367,40 @@ async fn run_app(
             terminal.draw(|f| {
                 let chunks = ui::layout::get_layout(f.area());
 
-                ui::layout::render_header(f, chunks[0]);
+                ui::layout::render_header(f, chunks[0], &app);
+
+                // The split is on only when the pane is open *and* the main
+                // area clears the size thresholds; below them the full-area
+                // search modes render instead, exactly like before panes
+                // existed. Key handlers gate focus routing on this flag, so
+                // a hidden pane never steals j/k from the visible table.
+                let split_active = app.search_pane_open
+                    && ui::layout::use_split_layout(chunks[1], app.split_vertical);
+                app.split_active = split_active;
 
                 match app.mode {
                     AppMode::Detail => {
                         ui::detail::render_detail(f, chunks[1], &mut app);
                         app.table_area = None;
+                    }
+                    AppMode::SearchResults if !split_active => {
+                        ui::search::render_search_results(f, chunks[1], &mut app);
+                        app.table_area = None;
+                    }
+                    _ if split_active => {
+                        let panes = ui::layout::split_main(chunks[1], app.split_vertical);
+                        app.table_area = Some(panes[0]);
+                        ui::table::render_table(f, panes[0], &mut app);
+                        // The query strip is editable only while the user is
+                        // actually typing in it.
+                        let input_active = app.mode == AppMode::SearchInput;
+                        ui::search::render_search_pane(
+                            f,
+                            panes[1],
+                            &mut app,
+                            &input_widget,
+                            input_active,
+                        );
                     }
                     _ => {
                         app.table_area = Some(chunks[1]);
@@ -351,10 +410,15 @@ async fn run_app(
 
                 match app.mode {
                     AppMode::Input => {
-                        ui::input::render_input(f, chunks[2], &input_widget);
+                        ui::input::render_input(f, chunks[2], &input_widget, &app.theme);
+                    }
+                    // With the split on screen the query is edited in the
+                    // pane's own strip, so the bottom bar stays a status bar.
+                    AppMode::SearchInput if !split_active => {
+                        ui::input::render_search_input(f, chunks[2], &input_widget, &app.theme);
                     }
                     AppMode::Filter => {
-                        ui::layout::render_filter_bar(f, chunks[2], &app.filter_text);
+                        ui::layout::render_filter_bar(f, chunks[2], &app.filter_text, &app.theme);
                     }
                     AppMode::ThrottleInput => {
                         ui::layout::render_throttle_bar(
@@ -362,6 +426,7 @@ async fn run_app(
                             chunks[2],
                             app.throttle_step,
                             &app.throttle_input_buf,
+                            &app.theme,
                         );
                     }
                     _ => {
@@ -370,27 +435,22 @@ async fn run_app(
                 }
 
                 if app.mode == AppMode::Help {
-                    ui::help::render_help(f, f.area());
+                    ui::help::render_help(f, f.area(), &app.theme);
                 }
                 if app.mode == AppMode::ConfirmDelete {
-                    let label = if app.has_marks() {
-                        format!("{} selected torrents", app.marked_count())
-                    } else {
-                        app.selected_torrent()
-                            .map(|t| t.name.clone())
-                            .unwrap_or_default()
-                    };
+                    let label = delete_dialog_label(&app);
                     if !label.is_empty() {
                         ui::dialogs::render_delete_dialog(
                             f,
                             f.area(),
                             &label,
                             app.watch_dir_configured,
+                            &app.theme,
                         );
                     }
                 }
                 if app.mode == AppMode::ConfirmQuit {
-                    ui::dialogs::render_quit_dialog(f, f.area());
+                    ui::dialogs::render_quit_dialog(f, f.area(), &app.theme);
                 }
             })?;
         }
@@ -446,10 +506,26 @@ async fn run_app(
                             AppMode::ConfirmQuit => handle_quit_mode(&mut app, key),
                             AppMode::Filter => handle_filter_mode(&mut app, key),
                             AppMode::ThrottleInput => handle_throttle_mode(&mut app, key, &cmd_tx).await,
+                            AppMode::SearchInput => {
+                                // The handler is pure state; the network spawn
+                                // stays here so tests never touch it.
+                                if let Some(query) =
+                                    handle_search_input_mode(&mut app, &mut input_widget, key)
+                                {
+                                    let providers = search_providers.clone();
+                                    let tx = search_tx.clone();
+                                    tokio::spawn(async move {
+                                        search::run_search(providers, query, tx).await;
+                                    });
+                                }
+                            }
+                            AppMode::SearchResults => {
+                                handle_search_results_mode(&mut app, &mut input_widget, key, &cmd_tx).await
+                            }
                         }
                         needs_render = true;
                     }
-                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::Input => {
+                    Some(Ok(Event::Paste(s))) if app.mode == AppMode::Input || app.mode == AppMode::SearchInput => {
                         // Bracketed-paste payload (e.g. a magnet link from the
                         // clipboard). push_str filters control chars per-char
                         // so escape sequences in the paste never reach the
@@ -512,6 +588,10 @@ async fn run_app(
                 apply_engine_info(&mut app, info);
                 needs_render = true;
             }
+            Some(response) = search_rx.recv() => {
+                app.apply_search_response(response);
+                needs_render = true;
+            }
             _ = frame_interval.tick() => {
                 // Only burn a render frame when something actually animates.
                 // Disk-space refresh is internally throttled to ~5s.
@@ -528,7 +608,7 @@ async fn run_app(
                 }
                 let disk_changed = prev_disk != app.free_disk_space;
 
-                if app.has_fetching_metadata() {
+                if app.has_fetching_metadata() || app.search_in_flight || !app.pending_adds.is_empty() {
                     app.tick_spinner();
                     needs_render = true;
                 } else if disk_changed
@@ -557,11 +637,49 @@ async fn handle_normal_mode(
                 app.should_quit = true;
             }
         }
-        KeyCode::Char('j') | KeyCode::Down => app.next(),
-        KeyCode::Char('k') | KeyCode::Up => app.previous(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            // With the split on screen, navigation belongs to the focused
+            // pane; without it, always to the downloads table.
+            if app.search_has_focus() {
+                app.search_next()
+            } else {
+                app.next()
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if app.search_has_focus() {
+                app.search_previous()
+            } else {
+                app.previous()
+            }
+        }
         KeyCode::Char('a') => {
             app.mode = AppMode::Input;
             input_widget.clear();
+        }
+        KeyCode::Char('s') => {
+            if app.search_pane_open {
+                // Pane already open: refocus it and reopen the query for
+                // editing, pre-filled — iterating on a search is editing,
+                // not retyping.
+                app.focused = Pane::Search;
+                app.mode = AppMode::SearchInput;
+                input_widget.clear();
+                let query = app.search_query.clone();
+                input_widget.push_str(&query);
+            } else {
+                app.open_search_pane();
+                input_widget.clear();
+            }
+        }
+        KeyCode::Char('w') if app.search_pane_open => {
+            app.cycle_focus();
+        }
+        KeyCode::Char('|') if app.search_pane_open => {
+            app.toggle_split();
+        }
+        KeyCode::Char('g') if app.search_has_focus() => {
+            app.cycle_search_group();
         }
         KeyCode::Char('p') => {
             if app.has_marks() {
@@ -570,12 +688,14 @@ async fn handle_normal_mode(
                 // throttle-paused torrent does not count: it reports Paused
                 // mid duty cycle while the user never asked for it, and
                 // treating it as paused flipped this whole batch to Resume
-                // whenever a speed limit was set (#47).
+                // whenever a speed limit was set (#47). Queued torrents do
+                // count — resuming them is how the user starts one early.
                 let any_paused = ids.iter().any(|id| {
                     app.torrents.iter().any(|t| {
                         t.id == *id
-                            && matches!(t.status, types::TorrentStatus::Paused)
-                            && !t.throttle_managed
+                            && (matches!(t.status, types::TorrentStatus::Queued)
+                                || (matches!(t.status, types::TorrentStatus::Paused)
+                                    && !t.throttle_managed))
                     })
                 });
                 // Send the whole batch as one message — the 32-slot channel
@@ -608,7 +728,10 @@ async fn handle_normal_mode(
                         | types::TorrentStatus::Seeding => {
                             send_cmd(cmd_tx, EngineCommand::Pause(id), app).await;
                         }
-                        types::TorrentStatus::Paused => {
+                        types::TorrentStatus::Paused | types::TorrentStatus::Queued => {
+                            // Queued resumes like a user pause: it leaves the
+                            // queue and starts immediately, possibly over the
+                            // configured cap — explicit intent wins.
                             send_cmd(cmd_tx, EngineCommand::Resume(id), app).await;
                         }
                         types::TorrentStatus::FetchingMetadata => {
@@ -634,6 +757,7 @@ async fn handle_normal_mode(
                         t.status,
                         types::TorrentStatus::Downloading
                             | types::TorrentStatus::Paused
+                            | types::TorrentStatus::Queued
                             | types::TorrentStatus::Complete
                             | types::TorrentStatus::Seeding
                     )
@@ -641,7 +765,10 @@ async fn handle_normal_mode(
                 .collect();
             let all_paused = !pausable.is_empty()
                 && pausable.iter().all(|t| {
-                    matches!(t.status, types::TorrentStatus::Paused) && !t.throttle_managed
+                    // Queued counts as paused: it is engine-held, not running,
+                    // so `P` on an all-held session resumes everything.
+                    (matches!(t.status, types::TorrentStatus::Paused) && !t.throttle_managed)
+                        || matches!(t.status, types::TorrentStatus::Queued)
                 });
 
             let cmd = if all_paused {
@@ -656,6 +783,11 @@ async fn handle_normal_mode(
         // drawn, leaving the user in a modal with nothing on screen.
         KeyCode::Char('d') if !app.sorted_torrents().is_empty() || app.has_marks() => {
             app.mode = AppMode::ConfirmDelete;
+        }
+        KeyCode::Enter if app.search_has_focus() => {
+            // Enter on the focused search pane adds the selected hit and
+            // stays put, so several hits can be queued from one search.
+            add_selected_search_result(app, cmd_tx).await;
         }
         KeyCode::Enter if !app.sorted_torrents().is_empty() => {
             app.mode = AppMode::Detail;
@@ -690,6 +822,10 @@ async fn handle_normal_mode(
                 String::new()
             };
         }
+        // Session-only theme cycling; the `preset` key in config.toml is the
+        // persistence path. The keypress path sets `needs_render` afterwards,
+        // so the repaint comes for free.
+        KeyCode::Char('T') => app.cycle_theme(),
         KeyCode::Char(' ') => {
             app.toggle_mark();
             app.next();
@@ -701,7 +837,15 @@ async fn handle_normal_mode(
             app.clear_marks();
         }
         KeyCode::Esc => {
-            app.clear_marks();
+            // First Esc with the split on screen and focus on Search closes
+            // the pane; anything else keeps the long-standing "clear marks"
+            // meaning. The split_active gate (inside search_has_focus) keeps
+            // a hidden pane on a small terminal from swallowing the key.
+            if app.search_has_focus() {
+                app.close_search_pane();
+            } else {
+                app.clear_marks();
+            }
         }
         _ => {}
     }
@@ -723,7 +867,18 @@ async fn handle_input_mode(
             let value = config::expand_tilde(input_widget.value().trim());
             match validate_torrent_source(&value) {
                 Ok(()) => {
-                    send_cmd(cmd_tx, EngineCommand::AddTorrent(value), app).await;
+                    // The `a` dialog stays ungrouped; groups are picked in the
+                    // search results view.
+                    app.push_pending_add(value.clone());
+                    send_cmd(
+                        cmd_tx,
+                        EngineCommand::AddTorrent {
+                            source: value,
+                            group: None,
+                        },
+                        app,
+                    )
+                    .await;
                     app.mode = AppMode::Normal;
                 }
                 Err(e) => {
@@ -737,6 +892,115 @@ async fn handle_input_mode(
         }
         KeyCode::Char(c) => {
             input_widget.push(c);
+        }
+        _ => {}
+    }
+}
+
+/// Keys for the search prompt. Pure state transitions: Enter on a non-empty
+/// query returns it for the caller to spawn `run_search` with (keeping the
+/// network out of tests); Esc leaves the prompt.
+fn handle_search_input_mode(
+    app: &mut App,
+    input_widget: &mut InputWidget,
+    key: crossterm::event::KeyEvent,
+) -> Option<String> {
+    match key.code {
+        KeyCode::Esc => {
+            // With the pane open, Esc only stops editing: the pane stays
+            // open with its results browsable (focus moves to Search). The
+            // follow-up Esc — now in Normal mode — is the one that closes
+            // the pane. With no pane this is the old plain cancel.
+            app.mode = AppMode::Normal;
+            if app.search_pane_open {
+                app.focused = Pane::Search;
+            }
+            None
+        }
+        KeyCode::Enter => {
+            let query = input_widget.value().trim().to_string();
+            if query.is_empty() {
+                // Nothing to search for — stay in the prompt rather than
+                // firing an empty query at every provider.
+                None
+            } else {
+                app.begin_search(query.clone());
+                Some(query)
+            }
+        }
+        KeyCode::Backspace => {
+            input_widget.pop();
+            None
+        }
+        KeyCode::Char(c) => {
+            input_widget.push(c);
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Send `AddTorrent` for the selected search hit, tagged with the sticky
+/// `search_group`. Shared by the results-mode Enter and the split-pane
+/// routing (Normal mode, focus on Search). Stays in the current view so
+/// several hits can be queued from one search.
+async fn add_selected_search_result(app: &mut App, cmd_tx: &mpsc::Sender<EngineCommand>) {
+    // Clone out of the borrow before mutating `app` for the message.
+    let selected = app
+        .selected_search_result()
+        .map(|r| (r.magnet.clone(), r.title.clone()));
+    if let Some((magnet, title)) = selected {
+        let group = app.search_group.clone();
+        // Placeholder row for the table; popped when the engine's
+        // `AddFinished` arrives, however the add resolves.
+        app.push_pending_add(title.clone());
+        send_cmd(
+            cmd_tx,
+            EngineCommand::AddTorrent {
+                source: magnet,
+                group: group.clone(),
+            },
+            app,
+        )
+        .await;
+        match group {
+            // The engine confirms completion ("Added:"/"Queued:"/"Failed") via
+            // the message channel once the add actually resolves; claiming
+            // "Added" here would lie for dead magnets.
+            Some(g) => app.set_info(format!("Adding: {} \u{2192} {}\u{2026}", title, g)),
+            None => app.set_info(format!("Adding: {}\u{2026}", title)),
+        }
+    }
+}
+
+/// Keys for the results view: navigate, add the selected hit, refine the
+/// search, or leave. Enter deliberately stays in the view so several hits can
+/// be queued from one search.
+async fn handle_search_results_mode(
+    app: &mut App,
+    input_widget: &mut InputWidget,
+    key: crossterm::event::KeyEvent,
+    cmd_tx: &mpsc::Sender<EngineCommand>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            // Like the prompt's Esc: the pane (when open) survives with its
+            // hits; closing it is the next Esc's job, from Normal mode.
+            app.mode = AppMode::Normal;
+            if app.search_pane_open {
+                app.focused = Pane::Search;
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.search_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.search_previous(),
+        KeyCode::Enter => add_selected_search_result(app, cmd_tx).await,
+        KeyCode::Char('g') => app.cycle_search_group(),
+        KeyCode::Char('s') => {
+            // Refine: back to the prompt with the current query pre-filled,
+            // so iterating on a search is editing, not retyping.
+            app.mode = AppMode::SearchInput;
+            input_widget.clear();
+            input_widget.push_str(&app.search_query);
         }
         _ => {}
     }
@@ -1001,11 +1265,37 @@ fn handle_quit_mode(app: &mut App, key: crossterm::event::KeyEvent) {
     }
 }
 
+/// The ConfirmDelete question line. A single unmarked selection names the
+/// torrent; with marks the count is the honest summary — the old label
+/// quoted a generated "N selected torrents" string, which read like a
+/// filename wrapped in someone else's quotes. Empty when there is nothing
+/// to point at (filter matched nothing and nothing marked); the caller
+/// skips drawing the dialog then, matching the old empty-label behavior.
+/// The object phrase only — `"name"` for a single row, a count for marks.
+/// The dialog supplies the surrounding "Delete ... ?" wording; this used to
+/// duplicate it, rendering as: Delete "Delete "foo"?". Empty when there is
+/// nothing to point at (filter matched nothing and nothing marked); the
+/// caller skips drawing the dialog then.
+fn delete_dialog_label(app: &App) -> String {
+    if app.has_marks() {
+        let n = app.marked_count();
+        format!("{} marked torrent{}", n, if n == 1 { "" } else { "s" })
+    } else {
+        app.selected_torrent()
+            .map(|t| format!("\"{}\"", ui::util::truncate(&t.name, 40)))
+            .unwrap_or_default()
+    }
+}
+
 fn apply_engine_info(app: &mut App, info: EngineInfo) {
     match info {
         EngineInfo::HttpApiReady { base_url } => {
             app.http_api_base = Some(base_url);
         }
+        // One completed add pairs with one dispatched-add placeholder; the
+        // engine sends this on every add outcome (success, queued,
+        // already-managed, failure).
+        EngineInfo::AddFinished => app.pop_pending_add(),
     }
 }
 
@@ -1274,6 +1564,7 @@ mod tests {
         types::TorrentInfo {
             id,
             name: format!("t{id}"),
+            group: None,
             size_bytes: 100,
             downloaded_bytes: 10,
             uploaded_bytes: 0,
@@ -1383,6 +1674,57 @@ mod tests {
         assert_eq!(app.mode, AppMode::ThrottleInput);
     }
 
+    #[tokio::test]
+    async fn normal_mode_t_cycles_themes_and_wraps() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+
+        // Startup state: the "config" slot holds the resolved config theme.
+        assert_eq!(app.theme_name, "config");
+        assert_eq!(app.theme, app.config_theme);
+
+        // First press moves to the first preset and announces it.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('T')), &tx).await;
+        assert_eq!(app.theme_name, "default");
+        assert_eq!(app.theme, crate::ui::theme::Theme::default());
+        assert_eq!(app.info_message.as_deref(), Some("Theme: default"));
+
+        // Walk the rest of the presets.
+        for name in &crate::ui::theme::Theme::PRESET_NAMES[1..] {
+            handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('T')), &tx).await;
+            assert_eq!(&app.theme_name, name);
+            assert_eq!(app.theme, crate::ui::theme::Theme::preset(name).unwrap());
+        }
+
+        // Past the last preset the rotation wraps back to the config slot,
+        // restoring any per-key overrides the session started with.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('T')), &tx).await;
+        assert_eq!(app.theme_name, "config");
+        assert_eq!(app.theme, app.config_theme);
+    }
+
+    #[tokio::test]
+    async fn normal_mode_t_restores_config_overrides() {
+        // A config theme with a per-key override must survive a full cycle —
+        // that is the whole point of the "config" slot.
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.config_theme = crate::ui::theme::Theme::preset("dracula").unwrap();
+        app.config_theme.accent = ratatui::style::Color::Red;
+        app.theme = app.config_theme.clone();
+        let overridden = app.config_theme.clone();
+
+        let slots = crate::ui::theme::Theme::PRESET_NAMES.len() + 1;
+        for _ in 0..slots {
+            handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('T')), &tx).await;
+        }
+        assert_eq!(app.theme_name, "config");
+        assert_eq!(app.theme, overridden);
+        assert_eq!(app.theme.accent, ratatui::style::Color::Red);
+    }
+
     #[test]
     fn stream_keypress_without_api_sets_error() {
         let mut app = App::new();
@@ -1392,5 +1734,392 @@ mod tests {
             app.error_message.as_deref(),
             Some("Streaming API not ready yet")
         );
+    }
+
+    fn search_result(title: &str, magnet: &str) -> search::SearchResult {
+        search::SearchResult {
+            title: title.to_string(),
+            magnet: magnet.to_string(),
+            size_bytes: 1024,
+            seeders: 10,
+            leechers: 2,
+            provider: "TPB".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_mode_s_opens_search_input() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('s')), &tx).await;
+        assert_eq!(app.mode, AppMode::SearchInput);
+        assert_eq!(iw.value(), "");
+    }
+
+    #[test]
+    fn search_input_enter_with_text_starts_search() {
+        // The handler returns the query for run_app to spawn `run_search`
+        // with — the spawn itself is the thin, untested shell.
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.mode = AppMode::SearchInput;
+        iw.push_str("ubuntu");
+        let query = handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Enter));
+        assert_eq!(query.as_deref(), Some("ubuntu"));
+        assert!(app.search_in_flight);
+        assert_eq!(app.search_query, "ubuntu");
+        // The results view opens immediately so the spinner has somewhere to
+        // render while the providers answer.
+        assert_eq!(app.mode, AppMode::SearchResults);
+        assert!(app.search_results.is_empty());
+    }
+
+    #[test]
+    fn search_input_enter_on_empty_query_stays_put() {
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.mode = AppMode::SearchInput;
+        iw.push_str("   ");
+        let query = handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Enter));
+        assert_eq!(query, None);
+        assert_eq!(app.mode, AppMode::SearchInput);
+        assert!(!app.search_in_flight);
+    }
+
+    #[test]
+    fn search_input_typing_and_esc() {
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.mode = AppMode::SearchInput;
+        handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Char('a')));
+        handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Char('b')));
+        handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Backspace));
+        assert_eq!(iw.value(), "a");
+        handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn search_response_populates_results_and_leaves_in_flight() {
+        let mut app = App::new();
+        app.begin_search("x".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![search_result("A", "magnet:?xt=urn:btih:aaa")],
+            errors: Vec::new(),
+        });
+        assert!(!app.search_in_flight);
+        assert_eq!(app.mode, AppMode::SearchResults);
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(
+            app.selected_search_result().unwrap().magnet,
+            "magnet:?xt=urn:btih:aaa"
+        );
+    }
+
+    #[test]
+    fn search_response_with_no_hits_shows_a_message() {
+        let mut app = App::new();
+        app.begin_search("nothing".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "nothing".to_string(),
+            results: Vec::new(),
+            errors: Vec::new(),
+        });
+        assert_eq!(
+            app.info_message.as_deref(),
+            Some("No results for 'nothing'")
+        );
+    }
+
+    #[test]
+    fn search_response_provider_errors_are_summarized() {
+        let mut app = App::new();
+        app.begin_search("x".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![search_result("A", "magnet:?xt=urn:btih:aaa")],
+            errors: vec![("TPB".to_string(), "connection timed out".to_string())],
+        });
+        let err = app.error_message.as_deref().expect("an error message");
+        assert!(err.contains("TPB"), "{err:?}");
+        assert!(err.contains("connection timed out"), "{err:?}");
+        // Partial failure still keeps the hits that did arrive.
+        assert_eq!(app.search_results.len(), 1);
+    }
+
+    #[test]
+    fn search_response_after_esc_does_not_yank_the_view_back() {
+        // User bailed to Normal mid-search: the hits still land, but the UI
+        // stays where they put it.
+        let mut app = App::new();
+        app.begin_search("x".to_string());
+        app.mode = AppMode::Normal;
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![search_result("A", "magnet:?xt=urn:btih:aaa")],
+            errors: Vec::new(),
+        });
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.search_in_flight);
+        assert_eq!(app.search_results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_results_enter_adds_the_selected_magnet() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.begin_search("x".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![
+                search_result("First", "magnet:?xt=urn:btih:first"),
+                search_result("Second", "magnet:?xt=urn:btih:second"),
+            ],
+            errors: Vec::new(),
+        });
+        app.search_next();
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command should have been sent") {
+            EngineCommand::AddTorrent { source, group } => {
+                assert_eq!(source, "magnet:?xt=urn:btih:second");
+                assert_eq!(group, None);
+            }
+            other => panic!("expected AddTorrent, got {other:?}"),
+        }
+        assert_eq!(app.info_message.as_deref(), Some("Adding: Second\u{2026}"));
+        // Stays in the results view so several hits can be queued.
+        assert_eq!(app.mode, AppMode::SearchResults);
+    }
+
+    #[tokio::test]
+    async fn search_results_enter_with_a_group_tags_the_add() {
+        let (tx, mut rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.group_names = vec!["linux".to_string()];
+        app.begin_search("x".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![search_result("Ubuntu", "magnet:?xt=urn:btih:ubuntu")],
+            errors: Vec::new(),
+        });
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Char('g')), &tx).await;
+        assert_eq!(app.search_group.as_deref(), Some("linux"));
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command should have been sent") {
+            EngineCommand::AddTorrent { source, group } => {
+                assert_eq!(source, "magnet:?xt=urn:btih:ubuntu");
+                assert_eq!(group.as_deref(), Some("linux"));
+            }
+            other => panic!("expected AddTorrent, got {other:?}"),
+        }
+        assert_eq!(
+            app.info_message.as_deref(),
+            Some("Adding: Ubuntu \u{2192} linux\u{2026}")
+        );
+    }
+
+    #[tokio::test]
+    async fn search_results_esc_returns_to_normal() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.mode = AppMode::SearchResults;
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Esc), &tx).await;
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn search_results_s_reopens_the_prompt_with_the_query_prefilled() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.begin_search("ubuntu".to_string());
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Char('s')), &tx).await;
+        assert_eq!(app.mode, AppMode::SearchInput);
+        assert_eq!(iw.value(), "ubuntu");
+    }
+
+    #[tokio::test]
+    async fn search_results_navigation_clamps_at_both_ends() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.begin_search("x".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![
+                search_result("First", "magnet:?xt=urn:btih:first"),
+                search_result("Second", "magnet:?xt=urn:btih:second"),
+            ],
+            errors: Vec::new(),
+        });
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Char('k')), &tx).await;
+        assert_eq!(app.search_index, 0);
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Char('j')), &tx).await;
+        handle_search_results_mode(&mut app, &mut iw, key(KeyCode::Char('j')), &tx).await;
+        assert_eq!(app.search_index, 1);
+        assert_eq!(app.search_state.selected(), Some(1));
+    }
+
+    /// An app mid-split: pane open, split on screen, two downloads and two
+    /// search hits to navigate. Handlers gate focus routing on
+    /// `split_active`, which is normally set by the render dispatch — tests
+    /// set it by hand.
+    fn app_in_split() -> (
+        mpsc::Sender<EngineCommand>,
+        mpsc::Receiver<EngineCommand>,
+        App,
+        InputWidget,
+    ) {
+        let (tx, rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        app.handle_state_push(vec![
+            torrent(0, types::TorrentStatus::Downloading, false),
+            torrent(1, types::TorrentStatus::Downloading, false),
+        ]);
+        app.open_search_pane();
+        app.split_active = true;
+        app.begin_search("x".to_string());
+        app.apply_search_response(search::SearchResponse {
+            query: "x".to_string(),
+            results: vec![
+                search_result("First", "magnet:?xt=urn:btih:first"),
+                search_result("Second", "magnet:?xt=urn:btih:second"),
+            ],
+            errors: Vec::new(),
+        });
+        app.mode = AppMode::Normal;
+        (tx, rx, app, InputWidget::new())
+    }
+
+    #[tokio::test]
+    async fn normal_mode_s_opens_the_search_pane() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('s')), &tx).await;
+        assert!(app.search_pane_open);
+        assert_eq!(app.focused, Pane::Search);
+        assert_eq!(app.mode, AppMode::SearchInput);
+        assert_eq!(iw.value(), "");
+    }
+
+    #[tokio::test]
+    async fn normal_mode_s_with_pane_open_refocuses_and_prefills() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let (.., mut app, mut iw) = app_in_split();
+        app.focused = Pane::Downloads;
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('s')), &tx).await;
+        assert!(app.search_pane_open);
+        assert_eq!(app.focused, Pane::Search);
+        assert_eq!(app.mode, AppMode::SearchInput);
+        assert_eq!(iw.value(), "x");
+    }
+
+    #[tokio::test]
+    async fn w_cycles_focus_only_with_the_pane_open() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(8);
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        // Pane closed: `w` is inert.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('w')), &tx).await;
+        assert_eq!(app.focused, Pane::Downloads);
+
+        let (tx, _rx, mut app, mut iw) = app_in_split();
+        app.focused = Pane::Downloads;
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('w')), &tx).await;
+        assert_eq!(app.focused, Pane::Search);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('w')), &tx).await;
+        assert_eq!(app.focused, Pane::Downloads);
+        // Focus switching never changes the mode.
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn pipe_toggles_the_split_orientation() {
+        let (tx, _rx, mut app, mut iw) = app_in_split();
+        assert!(app.split_vertical);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('|')), &tx).await;
+        assert!(!app.split_vertical);
+    }
+
+    #[tokio::test]
+    async fn focused_search_pane_owns_jk_and_enter() {
+        let (tx, mut rx, mut app, mut iw) = app_in_split();
+        // `j` moves the results cursor, not the downloads selection.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('j')), &tx).await;
+        assert_eq!(app.search_index, 1);
+        assert_eq!(app.selected_index, 0);
+        // Enter adds the selected hit, tagged with the search group.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        match rx.try_recv().expect("a command should have been sent") {
+            EngineCommand::AddTorrent { source, .. } => {
+                assert_eq!(source, "magnet:?xt=urn:btih:second")
+            }
+            other => panic!("expected AddTorrent, got {other:?}"),
+        }
+        // `g` cycles the add-target group on the focused pane.
+        app.group_names = vec!["linux".to_string()];
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('g')), &tx).await;
+        assert_eq!(app.search_group.as_deref(), Some("linux"));
+    }
+
+    #[tokio::test]
+    async fn focused_downloads_pane_keeps_the_usual_keys() {
+        let (tx, _rx, mut app, mut iw) = app_in_split();
+        app.focused = Pane::Downloads;
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('j')), &tx).await;
+        assert_eq!(app.selected_index, 1);
+        assert_eq!(app.search_index, 0);
+        // Enter on downloads opens Detail, as always.
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Enter), &tx).await;
+        assert_eq!(app.mode, AppMode::Detail);
+    }
+
+    #[tokio::test]
+    async fn hidden_pane_does_not_steal_navigation() {
+        // Pane open but the split didn't fit (small terminal): j/k must stay
+        // on the downloads table the user can actually see.
+        let (tx, _rx, mut app, mut iw) = app_in_split();
+        app.split_active = false;
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Char('j')), &tx).await;
+        assert_eq!(app.selected_index, 1);
+        assert_eq!(app.search_index, 0);
+    }
+
+    #[test]
+    fn search_input_esc_keeps_the_pane_open() {
+        let mut app = App::new();
+        let mut iw = InputWidget::new();
+        app.open_search_pane();
+        handle_search_input_mode(&mut app, &mut iw, key(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.search_pane_open);
+        assert_eq!(app.focused, Pane::Search);
+    }
+
+    #[tokio::test]
+    async fn esc_on_focused_search_pane_closes_it() {
+        // The second Esc of the sequence: Normal mode, focus Search, split
+        // on screen — this one closes the pane.
+        let (tx, _rx, mut app, mut iw) = app_in_split();
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Esc), &tx).await;
+        assert!(!app.search_pane_open);
+        assert_eq!(app.focused, Pane::Downloads);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn esc_on_focused_downloads_still_clears_marks() {
+        let (tx, _rx, mut app, mut iw) = app_in_split();
+        app.focused = Pane::Downloads;
+        app.marked_ids.insert(0);
+        handle_normal_mode(&mut app, &mut iw, key(KeyCode::Esc), &tx).await;
+        assert!(!app.has_marks());
+        assert!(app.search_pane_open);
     }
 }
