@@ -34,7 +34,7 @@ toml = "1.0"
 # stack librqbit already pulls in, so this adds no second TLS implementation.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Torznab (Jackett/Prowlarr) search responses are XML.
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # Utilities
 dirs = "6"
